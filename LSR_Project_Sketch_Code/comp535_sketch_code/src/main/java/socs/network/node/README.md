@@ -1,6 +1,6 @@
-# PA2 Implementation and Running Notes
+# PA2 and PA3 Connect Implementation Notes
 
-This README describes our implementation of PA2. Run all commands below from the Java project directory containing `pom.xml`, `src/`, and `conf/`.
+This README describes PA2 and the PA3 `connect` extension. Run all commands below from the Java project directory containing `pom.xml`, `src/`, and `conf/`. The other PA3 commands and failure-detection mechanism are not implemented yet.
 
 ## Collaboration Statement
 
@@ -54,6 +54,7 @@ Type these at the router's `>>` prompt. Brackets describe placeholders: replace 
 |---|---|
 | `attach [Process IP] [Process Port] [Simulated IP] [Link Weight]` | Request a link using the destination's displayed identifiers. The receiver answers `Y` or `N`. Weight must be nonnegative. |
 | `start` | Perform HELLO handshakes and exchange LSDB snapshots with TWO_WAY neighbors. |
+| `connect [Process IP] [Process Port] [Simulated IP] [Link Weight]` | After a completed local `start`, request a new link, complete HELLO and synchronize/flood the LSDB automatically. The receiver answers `Y` or `N`. |
 | `neighbors` | Print directly connected TWO_WAY neighbors. |
 | `lsd` | Display the local link-state database. |
 | `detect [Destination Simulated IP]` | Compute and print the weighted shortest path. |
@@ -62,6 +63,17 @@ Type these at the router's `>>` prompt. Brackets describe placeholders: replace 
 | `quit` | Close this router's listener and exit the process. |
 
 `attach` stores the approved link but does not synchronize the LSDB. Wait for acceptance before running `start`. Commands accept repeated spaces or tabs between arguments and report usage for missing or extra arguments. `send` preserves whitespace inside the message body.
+
+## PA3 connect
+
+- Run `start` on the initiating router first. An isolated router can complete `start` and then use `connect`. A first start with failed handshakes or pending outgoing attach requests must be retried before connect is enabled. Receiving another router's HELLO does not count as executing local start; the receiver of connect does not itself need to have run start.
+- Connect shares the attach validation and port reservation code. Rejected requests, duplicate/pending links, self-links, full ports, negative weights and invalid process ports do not proceed to HELLO. Zero weight and local port slot 0 are valid. Process ports use the existing positive Java `short` range (1-32767).
+- Attach and connect run in background threads, keeping both terminals available to answer incoming Y/N questions. If requests cross, the outgoing request from the lexicographically smaller simulated IP takes precedence. This prevents the two ends from accepting different link weights. Reservations count toward capacity; if crossed requests exhaust the remaining slots, retry after the rejected request releases its reservation.
+- After three HELLO messages, the responder adds the link to its own LSA and returns a full LSDB in an LSAUPDATE on the same socket. This confirms processing of the third HELLO. The initiator then adds its own link, merges the received database and broadcasts its current full LSDB. Each endpoint increments only its own LSA sequence number, once per newly added link. Repeated HELLO/start does not duplicate the link or increase that sequence again.
+- Both ends exchange their existing topology so connect can join two running network components. Accepted new/newer LSAs are flooded to all TWO_WAY neighbors except their incoming neighbor. `detect` and `send` compute paths from the current LSDB.
+- A HELLO timeout prints failure, never `Link established`. An already accepted attach is kept for a later `start` retry; a refused TCP connection removes the local Link as before. Connection/header/HELLO reads time out after 5000 ms; the human Y/N decision deliberately has no read deadline. All routers in a run should use this rebuilt PA3 version because it adds an LSAUPDATE confirmation to the HELLO socket.
+
+To try connect, start two routers, run `start` on the initiator, then enter `connect` with the other router's displayed identifiers and a weight. Answer `Y` on the receiver. The initiator prints `Link established with ...` and `Broadcasting LSAUPDATE.`. Check `neighbors`, `lsd`, `detect` and `send` on both sides; also connect two existing chains and test paths/messages between their far endpoints.
 
 We keep `connect`, `disconnect`, and `update` as starter-code placeholders for later work; we do not implement dynamic topology changes in PA2.
 
@@ -113,7 +125,7 @@ Repeat `start`, `detect`, `send`, and `stats` without restarting the processes. 
 
 1. **`start` and LSDB broadcast.** When a router runs `start`, `processStart()` performs the three-way HELLO handshake with every attached neighbor, which moves each of them to TWO_WAY. As required by PA2, the router then broadcasts its link-state database (LSDB) to all of its TWO_WAY neighbors.
 
-2. **Responder side of the handshake.** The receiving router handles the handshake in a connection-handler thread: it receives a HELLO, replies with a HELLO, waits for the final HELLO, and then also marks the neighbor as TWO_WAY. If this link already appears in its own LSA, it sends a single one-way LSAUPDATE to that neighbor containing its current LSDB. If the link is new, it adds the link to its own LSA with `addNeighborToLSA()` and broadcasts the updated LSDB to all TWO_WAY neighbors. Because the new neighbor is one of the recipients, it immediately learns the whole topology that this router already knows.
+2. **Responder side of the handshake.** The receiving router handles the handshake in a connection-handler thread: it receives a HELLO, replies with a HELLO, waits for the final HELLO, and then also marks the neighbor as TWO_WAY. It adds a new link to its own LSA with `addNeighborToLSA()` and sends a full LSDB in an LSAUPDATE on the handshake socket to confirm completion. If the link was newly added, it also broadcasts the updated database. The initiator waits for this confirmation, installs its own LSA entry and merges the received LSDB before its final broadcast. The full database is exchanged on repeated handshakes too.
 
 3. **Receiving an LSAUPDATE.** Every message that carries LSAs has `sospfType = TYPE_LSU`. When the connection handler receives a packet of this type, it passes it to `receiveLSAUpdate(packet)`. The router merges the LSAs into its LSDB: an LSA is accepted only if its router is unknown or its sequence number is greater than that of the stored copy, and all other LSAs are discarded. If nothing was accepted, propagation stops here. Otherwise, the router forwards the accepted LSAs to all TWO_WAY neighbors except the one it received them from.
 
@@ -122,8 +134,9 @@ Repeat `start`, `detect`, `send`, and `stats` without restarting the processes. 
 5. **Receiving an application message.** When the connection handler receives a `TYPE_APP_MESSAGE` packet, it calls `handleApplicationMessage()`. If the destination IP is this router, the message is delivered and its payload is printed. Otherwise, the router calls `nextHopLink(destIP)` to compute the best path from its own LSDB and forwards the packet it received to the next neighbor on that path, leaving the original source IP and payload unchanged.
 
 6. **Counting received and handshake messages.** We added `stats.countReceived(packet.sospfType)` to the `connectionHandler` method from PA1, so the first packet of every incoming connection is counted by type. Any further message exchanged on the same connection must be counted inside the method that handles it:
-   - In `processAttach()`, the requester counts one ATTACH sent when it sends the request and one ATTACH received when the reply arrives. The reply has to be counted here because the Y/N answer comes back on the same connection and never passes through the connection handler.
+   - In `attachLink()` (shared by attach and connect), the requester counts one ATTACH sent when it sends the request and one ATTACH received when the reply arrives. The reply has to be counted here because the Y/N answer comes back on the same connection and never passes through the connection handler.
    - `processStart()` calls `helloHandshake()` for each neighbor, which counts every HELLO it sends and receives. On the responder side, the first HELLO is counted by the connection handler, and the HELLOs sent and received after it are counted inside the handler method.
+   - `handleHello()` counts the LSAUPDATE confirmation it sends on the handshake socket; `helloHandshake()` counts its receipt.
 
 7. **Counting in `sendOneWayMessage()`.** `sendOneWayMessage()` counts every message it sends, by type. Application messages that are sent or forwarded therefore do not need to be counted again in `processSend()` or `handleApplicationMessage()`, and the same holds for every LSAUPDATE that is broadcast or forwarded.
 

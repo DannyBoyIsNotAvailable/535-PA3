@@ -60,6 +60,10 @@ public class Router {
   // Other routers connect to this socket. It stays open until the router quits. 
   private ServerSocket serverSocket;
 
+  // PA3: only an explicitly completed local start enables outgoing connect.
+  // Receiving HELLO from another router does not set this flag.
+  private volatile boolean started = false;
+
   // Guards ports[], reservedPorts[] 
   private final Object portLock = new Object();
 
@@ -300,7 +304,8 @@ public class Router {
     synchronized (portLock) {
       // EDGE CASE: router1 is shared local rd; HELLO only advances router2.status
       // for this neighbor. Checking router1 would reject every valid link.
-      return link != null && link.router2.status == RouterStatus.TWO_WAY;
+      return link != null && getPort(link) >= 0
+          && link.router2.status == RouterStatus.TWO_WAY;
     }
   }
 
@@ -473,24 +478,31 @@ public class Router {
 
   private void processAttach(String processIP, short processPort,
                              String simulatedIP, short weight) {
+    attachLink(processIP, processPort, simulatedIP, weight);
+  }
+
+  /** Shared attach phase; null means THIS request did not establish a link. */
+  private Link attachLink(String processIP, short processPort,
+                          String simulatedIP, short weight) {
     // EDGE CASE: Dijkstra needs nonnegative weights. Validate before reserving
     // a port or sending a request; zero-cost links remain valid.
     if (weight < 0 || processPort <= 0) {
       System.out.println("Cannot attach: weight must be nonnegative and process port positive.");
-      return;
+      return null;
     }
     if (rd.simulatedIPAddress.equals(simulatedIP)) {
       System.out.println("Cannot attach to yourself.");
-      return;
+      return null;
     }
-    if (findLink(simulatedIP) != null) {
-      System.out.println("Cannot attach: a link to " + simulatedIP + " already exists.");
-      return;
-    }
-    // check if we have already sent the attach request
-    if (!outgoingAttachRouters.add(simulatedIP)) {// fail to add it
-      System.out.println("An attach request to " + simulatedIP + " is already pending.");
-      return;
+    synchronized (portLock) {
+      if (findLink(simulatedIP) != null) {
+        System.out.println("Cannot attach: a link to " + simulatedIP + " already exists.");
+        return null;
+      }
+      if (!outgoingAttachRouters.add(simulatedIP)) {
+        System.out.println("An attach request to " + simulatedIP + " is already pending.");
+        return null;
+      }
     }
 
     int port = -1;
@@ -499,7 +511,7 @@ public class Router {
       port = reservePort();
       if (port == -1) {
         System.out.println("Cannot attach: all ports are in use.");
-        return;
+        return null;
       }
 
       try (Socket socket = openSocket(processIP, processPort);
@@ -523,17 +535,35 @@ public class Router {
         if (reply.sospfType != TYPE_ATTACH || !simulatedIP.equals(reply.srcIP)
             || !rd.simulatedIPAddress.equals(reply.dstIP)) {
           System.out.println("Attach failed: unexpected reply.");
-          return;
+          return null;
         }
 
         if (ATTACH_ACCEPTED.equals(reply.message)) {
+          if (reply.weight != weight) {
+            System.out.println("Attach failed: inconsistent link weight in reply.");
+            return null;
+          }
           RouterDescription remote = new RouterDescription();
           remote.processIPAddress = processIP;
           remote.processPortNumber = processPort;
           remote.simulatedIPAddress = simulatedIP;
           remote.status = null; // attached, but no HELLO exchanged yet
-          committed = commitPort(port, new Link(rd, remote, weight)); // add link from reserve ports to ports
+          Link link = new Link(rd, remote, weight);
+          synchronized (portLock) {
+            committed = commitPort(port, link);
+            if (!committed) {
+              // EDGE CASE: an incoming attach may have installed the same link.
+              // Reuse it only when both requests agree on endpoint and cost.
+              link = findLink(simulatedIP);
+              if (link == null || link.weight != weight
+                  || link.router2.processPortNumber != processPort) {
+                System.out.println("Attach failed: conflicting concurrent request.");
+                return null;
+              }
+            }
+          }
           System.out.println("Your attach request has been accepted;");
+          return link;
         } else if (findLink(simulatedIP) != null) {
           // Simultaneous attach: the peer rejected our request, but we accepted theirs.
           System.out.println("Your attach request has been rejected;"
@@ -550,6 +580,13 @@ public class Router {
       }
       outgoingAttachRouters.remove(simulatedIP);
     }
+    return null;
+  }
+
+  /** The smaller simulated IP wins crossed requests, so costs cannot differ at each end. */
+  private boolean preferOutgoingAttach(String remoteIP) {
+    return outgoingAttachRouters.contains(remoteIP)
+        && rd.simulatedIPAddress.compareTo(remoteIP) < 0;
   }
 
   /**
@@ -562,6 +599,7 @@ public class Router {
     // initialise an new packet and let the msg = rejected
     SOSPFPacket reply = newPacket(TYPE_ATTACH, request.srcIP);
     reply.message = ATTACH_REJECTED;
+    reply.weight = request.weight;
 
     // Only one request ask the user at a time. The lock is held until the reply has
     // been sent, so a second request can never pick up the answer before the first one.
@@ -574,15 +612,22 @@ public class Router {
           System.out.println("received attach request from " + request.srcIP
               + " addressed to " + request.dstIP + " (not me); rejected automatically;");
 
-        } else if (request.weight < 0) {
+        } else if (request.weight < 0 || request.srcIP == null
+            || rd.simulatedIPAddress.equals(request.srcIP) || request.srcProcessPort <= 0) {
           // EDGE CASE: validate incoming requests as well as local commands.
-          System.out.println("Attach rejected: negative link weight.");
+          System.out.println("Attach rejected: invalid neighbor or link weight.");
         } else if (findLink(request.srcIP) != null) {
-          // Simultaneous attach: the other direction was already accepted. The link exists,
-          // so just confirm it instead of asking the user again.
-          System.out.println("received HELLO from " + request.srcIP
-              + "; a link already exists, accepted automatically;");
-          reply.message = ATTACH_ACCEPTED;
+          Link existing = findLink(request.srcIP);
+          if (existing.weight == request.weight
+              && existing.router2.processPortNumber == request.srcProcessPort) {
+            reply.message = ATTACH_ACCEPTED;
+            reply.weight = existing.weight;
+          } else {
+            System.out.println("Attach rejected: an existing link has a different endpoint or weight.");
+          }
+
+        } else if (preferOutgoingAttach(request.srcIP)) {
+          System.out.println("Attach rejected: keeping the outgoing request to " + request.srcIP + ";");
 
         } else if ((port = reservePort()) == -1) { // there no free port
           System.out.println("received HELLO from " + request.srcIP
@@ -597,9 +642,19 @@ public class Router {
             remote.processPortNumber = request.srcProcessPort;
             remote.simulatedIPAddress = request.srcIP;
             remote.status = null; // attached, but no HELLO exchanged yet
-            committed = commitPort(port, new Link(rd, remote, request.weight));
-            reply.message = ATTACH_ACCEPTED;
-            System.out.println("You accepted the attach request;");
+            synchronized (portLock) {
+              // EDGE CASE: an outgoing request may have started while Y/N was pending.
+              if (!preferOutgoingAttach(request.srcIP)) {
+                committed = commitPort(port, new Link(rd, remote, request.weight));
+                Link installed = findLink(request.srcIP);
+                if (installed != null && installed.weight == request.weight
+                    && installed.router2.processPortNumber == request.srcProcessPort) {
+                  reply.message = ATTACH_ACCEPTED;
+                }
+              }
+            }
+            System.out.println(ATTACH_ACCEPTED.equals(reply.message)
+                ? "You accepted the attach request;" : "Attach rejected: conflicting concurrent request.");
           } else {
             System.out.println("You rejected the attach request;");
           }
@@ -661,31 +716,39 @@ public class Router {
   // HELLO establishes neighbors; each start also exchanges the current full LSDB.
   private void processStart() {
     List<Link> links = snapshotLinks();
-    if (links.isEmpty()) {
-      System.out.println("No attached routers; run attach first.");
-      return;
-    }
+    boolean complete = true;
     for (Link link : links) {
-      helloHandshake(link);
+      if (!helloHandshake(link)) {
+        complete = false;
+      }
     }
     // EDGE CASE: repeated start and joining existing networks must exchange the
     // full LSDB even if this router's own LSA did not change.
     broadcastLSAUpdate(lsd.deepCopy(), null);
 
     if (!outgoingAttachRouters.isEmpty()) {
+      complete = false;
       System.out.println("Note: some attach requests are still waiting for an answer;"
           + " run start again once they are accepted.");
+    }
+    if (complete) {
+      started = true;
+      if (links.isEmpty()) {
+        System.out.println("Router started; no attached routers.");
+      }
+    } else {
+      System.out.println("Start incomplete; run start again after the pending requests or handshake failures.");
     }
   }
 
   /**
    * Initiator side of the handshake 
-   * send HELLO, receive HELLO (neighbour becomes TWO_WAY here), send HELLO again.
+   * Three HELLOs, followed by the peer's LSDB on the same socket as confirmation.
+   * Returns handshake success, not whether an LSA entry was newly inserted.
    */
 
-  // 这里不用写广播，因为helloHandshake只能在processStart中被调用
+  // Shared by start and connect; callers advertise the completed adjacency.
   private boolean helloHandshake(Link link) {
-    boolean result = false;
 
     RouterDescription neighbor = link.router2;
     try (Socket socket = openSocket(neighbor.processIPAddress, neighbor.processPortNumber);
@@ -704,18 +767,32 @@ public class Router {
       if (reply.sospfType != TYPE_HELLO || !neighbor.simulatedIPAddress.equals(reply.srcIP)
           || !rd.simulatedIPAddress.equals(reply.dstIP)) {
         System.out.println("start: unexpected reply from " + neighbor.simulatedIPAddress + ";");
-        return result;
+        return false;
       }
       System.out.println("received HELLO from " + reply.srcIP + ";");
       // 3rd HELLO, so the neighbour also reaches TWO_WAY
       out.writeObject(newPacket(TYPE_HELLO, neighbor.simulatedIPAddress));
       out.flush();
       stats.countSent(TYPE_HELLO);  // <----- +1
+      // PA3: wait until the peer has processed the third HELLO. Otherwise a
+      // successful write alone could falsely report a complete connect.
+      SOSPFPacket confirmation = readPacket(in);
+      stats.countReceived(confirmation.sospfType);
+      if (confirmation.sospfType != TYPE_LSU || confirmation.lsaArray == null
+          || !neighbor.simulatedIPAddress.equals(confirmation.srcIP)
+          || !rd.simulatedIPAddress.equals(confirmation.dstIP)) {
+        System.out.println("HELLO failed: missing LSDB confirmation from " + neighbor.simulatedIPAddress);
+        return false;
+      }
+      if (getPort(link) < 0) {
+        return false;
+      }
       advanceNeighborStatus(link, RouterStatus.TWO_WAY);
       // EDGE CASE: both ends may start simultaneously. Always try the idempotent
       // insertion, regardless of which thread advanced this neighbor's status.
-      result = addNeighborToLSA(link);
-      return result;
+      addNeighborToLSA(link);
+      receiveLSAUpdate(confirmation);
+      return isTwoWay(link);
 
     } catch (ConnectException e) {
       // "Connection refused": no process is listening on the neighbour's port any more, so
@@ -725,11 +802,11 @@ public class Router {
         System.out.println("start: " + neighbor.simulatedIPAddress
             + " is unreachable (connection refused); link removed;");
       }
-      return result;
+      return false;
     } catch (IOException | ClassNotFoundException e) {
       System.out.println("start: cannot reach " + neighbor.simulatedIPAddress
           + ": " + e.getMessage());
-      return result;
+      return false;
     }
   }
 
@@ -763,15 +840,20 @@ public class Router {
       return;
     }
     System.out.println("received HELLO from " + third.srcIP + ";");
+    if (getPort(link) < 0) {
+      return;
+    }
     advanceNeighborStatus(link, RouterStatus.TWO_WAY);
-    if (addNeighborToLSA(link)) {
-      broadcastLSAUpdate(lsd.deepCopy(), null);
-    } else {
-      // EDGE CASE: repeated HELLO still exchanges the full database. Equal
-      // sequence numbers stop these snapshots from flooding indefinitely.
-      SOSPFPacket update = newPacket(TYPE_LSU, link.router2.simulatedIPAddress);
-      update.lsaArray = lsd.deepCopy();
-      sendOneWayMessage(link.router2, update);
+    boolean changed = addNeighborToLSA(link);
+    // Confirm completion before flooding, which may involve slow neighbors.
+    // Always exchange the full LSDB, including on a repeated handshake.
+    SOSPFPacket update = newPacket(TYPE_LSU, link.router2.simulatedIPAddress);
+    update.lsaArray = lsd.deepCopy();
+    out.writeObject(update);
+    out.flush();
+    stats.countSent(TYPE_LSU);
+    if (changed) {
+      broadcastLSAUpdate(update.lsaArray, null);
     }
   }
 
@@ -848,7 +930,24 @@ public class Router {
    */
   private void processConnect(String processIP, short processPort,
                               String simulatedIP, short weight) {
-
+    if (!started) {
+      System.out.println("Cannot connect: run start first and let it complete.");
+      return;
+    }
+    Link link = attachLink(processIP, processPort, simulatedIP, weight);
+    if (link == null) {
+      return; // EDGE CASE: never handshake an old link after a rejected request.
+    }
+    if (!helloHandshake(link)) {
+      // Keep a timed-out attach for a later start retry; unilateral rollback
+      // would leave the peer's port occupied. No success is printed here.
+      System.out.println("Connect failed: HELLO handshake incomplete; run start to retry if still attached.");
+      return;
+    }
+    System.out.println("Link established with " + simulatedIP);
+    System.out.println("Broadcasting LSAUPDATE.");
+    // Both components must learn each other's existing topology, not just the new edge.
+    broadcastLSAUpdate(lsd.deepCopy(), null);
   }
 
   /**
@@ -1060,8 +1159,20 @@ public class Router {
       case "connect":
         if (hasArgumentCount(arguments, 5,
             "connect [Process IP] [Process Port] [Simulated IP] [Link Weight]")) {
-          processConnect(arguments[1], Short.parseShort(arguments[2]),
-              arguments[3], Short.parseShort(arguments[4]));
+          String processIP = arguments[1];
+          short processPort = Short.parseShort(arguments[2]);
+          String simulatedIP = arguments[3];
+          short weight = Short.parseShort(arguments[4]);
+          if (!started) {
+            System.out.println("Cannot connect: run start first and let it complete.");
+            break;
+          }
+          // EDGE CASE: keep the terminal available for incoming Y/N during crossed connects.
+          Thread connect = new Thread(
+              () -> processConnect(processIP, processPort, simulatedIP, weight),
+              "connect-" + simulatedIP);
+          connect.setDaemon(true);
+          connect.start();
         }
         break;
       case "neighbors":
