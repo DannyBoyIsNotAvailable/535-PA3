@@ -38,4 +38,7 @@ public class SOSPFPacket implements Serializable {
   public String weightOrigin;
   public String weightRequestId;
 
+  // Identifies one attach session for HELLO, weight updates and LINK_DOWN (type 5).
+  public String linkId;
+
 }

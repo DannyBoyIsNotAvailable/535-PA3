@@ -278,6 +278,15 @@ public synchronized Path findShortestPathTo(String destIP) {
     return false;
   }
 
+  /** Remove an advertised adjacency exactly once; retain the router's self-link. */
+  public synchronized boolean removeLinkFromLSA(String neighborIP) {
+    if (neighborIP == null || rd.simulatedIPAddress.equals(neighborIP)) return false;
+    LSA ownLSA = _store.get(rd.simulatedIPAddress);
+    boolean removed = ownLSA.links.removeIf(ld -> neighborIP.equals(ld.linkID));
+    if (removed) ownLSA.lsaSeqNumber++;
+    return removed;
+  }
+
   private boolean validLSA(LSA lsa) {
     if (lsa == null || lsa.linkStateID == null || lsa.links == null) return false;
     for (LinkDescription ld : lsa.links) {

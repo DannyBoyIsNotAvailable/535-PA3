@@ -1,6 +1,6 @@
-# PA2 and PA3 Connect / Weight Update Implementation Notes
+# PA2 and PA3 Connect / Update / Disconnect Implementation Notes
 
-This README describes PA2 and the PA3 `connect` and `update` extensions. Run all commands below from the Java project directory containing `pom.xml`, `src/`, and `conf/`. PA3 disconnect, graceful quit and their failure-detection mechanism are not implemented yet.
+This README describes PA2 and the PA3 `connect`, `update` and `disconnect` extensions. Run all commands below from the Java project directory containing `pom.xml`, `src/`, and `conf/`. Disconnect uses explicit adjacency-loss notifications as described below. PA3 graceful quit is not implemented yet.
 
 ## Collaboration Statement
 
@@ -56,11 +56,12 @@ Type these at the router's `>>` prompt. Brackets describe placeholders: replace 
 | `start` | Perform HELLO handshakes and exchange LSDB snapshots with TWO_WAY neighbors. |
 | `connect [Process IP] [Process Port] [Simulated IP] [Link Weight]` | After a completed local `start`, request a new link, complete HELLO and synchronize/flood the LSDB automatically. The receiver answers `Y` or `N`. |
 | `update [Port Number] [New Weight]` | Synchronize the weight of an occupied local slot (0-3) with its direct neighbor, update both endpoints' LSAs and flood the changes. New weight is a nonnegative Java int. |
+| `disconnect [Port Number]` | Remove an occupied local slot (0-3), notify its peer to remove the same adjacency, and flood both revised self-originated LSAs. |
 | `neighbors` | Print directly connected TWO_WAY neighbors. |
 | `lsd` | Display the local link-state database. |
 | `detect [Destination Simulated IP]` | Compute and print the weighted shortest path. |
 | `send [Destination Simulated IP] [Message]` | Deliver an application message along the shortest path. The message may contain spaces. |
-| `stats` | Display sent/received counts for HELLO, LSAUPDATE, APP_MESSAGE, ATTACH and WEIGHT_UPDATE. |
+| `stats` | Display sent/received counts for HELLO, LSAUPDATE, APP_MESSAGE, ATTACH, WEIGHT_UPDATE and LINK_DOWN. |
 | `quit` | Close this router's listener and exit the process. |
 
 `attach` stores the approved link but does not synchronize the LSDB. Wait for acceptance before running `start`. Commands accept repeated spaces or tabs between arguments and report usage for missing or extra arguments. `send` preserves whitespace inside the message body.
@@ -86,6 +87,19 @@ To try connect, start two routers, run `start` on the initiator, then enter `con
 - Updating an attached link before HELLO is allowed: both Link objects change, but an unestablished adjacency is not inserted into the LSA early. The later HELLO advertises the agreed cost. Weight changes do not trigger failure detection or remove a neighbor. All routers must run the rebuilt version because SOSPFPacket now includes weight version and request identity fields.
 
 For a routing check, create a chain plus a more expensive alternate route. Increase the weight of an edge on the original shortest path with `update`, wait for `Link weight updated`, then run `detect` and `send` at a different router. Verify the alternate path is selected, and decrease the edge weight again to restore the original path. Test updates from either end, different local port indices, duplicate/zero/large values, simultaneous updates and lost-confirmation retries.
+
+## PA3 disconnect and adjacency-loss notification
+
+- `disconnect 1` removes the Link currently occupying local slot 1. Ports outside 0-3 and unused ports are rejected. Removal sets the slot to null, clears pending weight state and removes the corresponding LinkDescription from the router's own LSA under the same port lock. Removing an advertised edge increments that router's own LSA sequence once. The self-link is retained. An attached but unadvertised edge is also removable; it does not create an LSA entry or spuriously change its sequence.
+- The initiating terminal prints `Port 1 disconnected` and `Broadcasting LSAUPDATE`, without trailing periods. Its listener and other links remain operational. Flooding to remaining TWO_WAY neighbors and notification of the removed peer run independently in background tasks; no port lock is held during network I/O.
+- **Failure-detection mechanism for disconnect:** an explicit LINK_DOWN request/reply (packet type 5) is sent using the saved peer process address after local removal. The receiver resolves its local Link from the sender's simulated IP, verifies the adjacency session and removes its own Link/LinkDescription. It sends LINK_DOWN_ACK before flooding its revised LSA to remaining neighbors. A repeated notification is acknowledged without another deletion or LSA sequence increment. If both endpoints disconnect simultaneously, each removes its local state once and acknowledges the other's notice.
+- Each attach request proposes a fresh UUID adjacency ID; its acceptance establishes the shared ID at both endpoints. HELLO, weight requests/confirmations and LINK_DOWN carry that ID. Removed IDs are retained as tombstones for the life of the router process. A delayed old disconnect or weight message cannot remove/change a reconnected Link, even when the same simulated IP, process port or local slot is reused. A delayed attach acceptance/HELLO cannot resurrect a retired adjacency.
+- Notifications use the existing 5000 ms connection/read deadlines with up to three attempts. Lost confirmations retry the same adjacency ID. If still unconfirmed, local removal remains in effect and the saved notice remains available: repeat `disconnect` on its now-empty old slot to retry it, without incrementing the LSA sequence again. An immediate attach/connect to the same peer process first waits for/retries the saved cleanup notice (up to 20 seconds per pending notice), and fails explicitly if cleanup is unconfirmed. Reconnecting to a different process port does not wait on the old process. A late retry can only reference the old ID.
+- Update commands capture their Link when queued and check that it is still installed before sending and after receiving confirmation. Thus a queued operation or delayed ACK cannot modify a newly connected neighbor in the same slot. Incoming weight requests from retired sessions are rejected. No weight timeout alone disconnects a link.
+- Normal per-message TCP sockets close after each exchange; their closure is not interpreted as adjacency loss. This implementation uses explicit notifications for graceful disconnect, not heartbeat detection of unannounced process crashes. Graceful quit will need to reuse the same neighbor-cleanup mechanism in its own implementation. All participating routers must use the rebuilt protocol version.
+- After convergence, `detect` and `send` use the reduced topology automatically. If another route exists they use it; otherwise they print `Path not found`. Both freed ports can be used by later attach/connect commands.
+
+For a demo, build a five-router chain with an alternate edge, disconnect a chain edge and check that both endpoints free their slots and advertise removal. Check `detect`/`send` from a third router, then disconnect a bridge to partition the topology and check `Path not found`. Reconnect with a different weight, replay an old notification, and verify that the new adjacency survives. Also test port 0, invalid/empty slots, repeated/simultaneous disconnect, update on a removed port, and disconnect during an in-flight weight update.
 
 We keep `connect`, `disconnect`, and `update` as starter-code placeholders for later work; we do not implement dynamic topology changes in PA2.
 
