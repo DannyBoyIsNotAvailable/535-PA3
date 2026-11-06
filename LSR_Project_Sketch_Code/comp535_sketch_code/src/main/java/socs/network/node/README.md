@@ -1,6 +1,6 @@
-# PA2 and PA3 Connect Implementation Notes
+# PA2 and PA3 Connect / Weight Update Implementation Notes
 
-This README describes PA2 and the PA3 `connect` extension. Run all commands below from the Java project directory containing `pom.xml`, `src/`, and `conf/`. The other PA3 commands and failure-detection mechanism are not implemented yet.
+This README describes PA2 and the PA3 `connect` and `update` extensions. Run all commands below from the Java project directory containing `pom.xml`, `src/`, and `conf/`. PA3 disconnect, graceful quit and their failure-detection mechanism are not implemented yet.
 
 ## Collaboration Statement
 
@@ -55,11 +55,12 @@ Type these at the router's `>>` prompt. Brackets describe placeholders: replace 
 | `attach [Process IP] [Process Port] [Simulated IP] [Link Weight]` | Request a link using the destination's displayed identifiers. The receiver answers `Y` or `N`. Weight must be nonnegative. |
 | `start` | Perform HELLO handshakes and exchange LSDB snapshots with TWO_WAY neighbors. |
 | `connect [Process IP] [Process Port] [Simulated IP] [Link Weight]` | After a completed local `start`, request a new link, complete HELLO and synchronize/flood the LSDB automatically. The receiver answers `Y` or `N`. |
+| `update [Port Number] [New Weight]` | Synchronize the weight of an occupied local slot (0-3) with its direct neighbor, update both endpoints' LSAs and flood the changes. New weight is a nonnegative Java int. |
 | `neighbors` | Print directly connected TWO_WAY neighbors. |
 | `lsd` | Display the local link-state database. |
 | `detect [Destination Simulated IP]` | Compute and print the weighted shortest path. |
 | `send [Destination Simulated IP] [Message]` | Deliver an application message along the shortest path. The message may contain spaces. |
-| `stats` | Display sent/received counts for HELLO, LSAUPDATE, APP_MESSAGE and ATTACH. |
+| `stats` | Display sent/received counts for HELLO, LSAUPDATE, APP_MESSAGE, ATTACH and WEIGHT_UPDATE. |
 | `quit` | Close this router's listener and exit the process. |
 
 `attach` stores the approved link but does not synchronize the LSDB. Wait for acceptance before running `start`. Commands accept repeated spaces or tabs between arguments and report usage for missing or extra arguments. `send` preserves whitespace inside the message body.
@@ -73,7 +74,18 @@ Type these at the router's `>>` prompt. Brackets describe placeholders: replace 
 - Both ends exchange their existing topology so connect can join two running network components. Accepted new/newer LSAs are flooded to all TWO_WAY neighbors except their incoming neighbor. `detect` and `send` compute paths from the current LSDB.
 - A HELLO timeout prints failure, never `Link established`. An already accepted attach is kept for a later `start` retry; a refused TCP connection removes the local Link as before. Connection/header/HELLO reads time out after 5000 ms; the human Y/N decision deliberately has no read deadline. All routers in a run should use this rebuilt PA3 version because it adds an LSAUPDATE confirmation to the HELLO socket.
 
-To try connect, start two routers, run `start` on the initiator, then enter `connect` with the other router's displayed identifiers and a weight. Answer `Y` on the receiver. The initiator prints `Link established with ...` and `Broadcasting LSAUPDATE.`. Check `neighbors`, `lsd`, `detect` and `send` on both sides; also connect two existing chains and test paths/messages between their far endpoints.
+To try connect, start two routers, run `start` on the initiator, then enter `connect` with the other router's displayed identifiers and a weight. Answer `Y` on the receiver. The initiator prints `Link established with ...` and `Broadcasting LSAUPDATE`. Check `neighbors`, `lsd`, `detect` and `send` on both sides; also connect two existing chains and test paths/messages between their far endpoints.
+
+## PA3 update weight
+
+- `update 1 12` changes the link in this router's slot 1 to cost 12. The peer finds its own Link using the sender's simulated IP; slot numbers can differ between the two endpoints. Ports outside 0-3, unused ports, negative weights and invalid numeric arguments are rejected. Weight 0 and weights up to 2147483647 are accepted. An unchanged, confirmed weight is a no-op.
+- A WEIGHT_UPDATE request/reply (packet type 4) explicitly synchronizes both Link objects. A normal LSAUPDATE alone only replaces remote LSAs and cannot perform this local adjacency change. The receiver applies an accepted weight to its Link and existing self-originated LinkDescription, sends confirmation, then floods its revised LSA. The initiator applies the confirmed result and broadcasts its database. Each actual change to an advertised local edge increments that endpoint's own LSA sequence once. Equal-weight versions do not increase it. Incoming LSAs never change the sequence number of the local router's LSA.
+- Each link orders weight changes by `(counter, origin simulated IP)`; the greater tuple wins. The counter is a logical clock, not an LSA sequence number or wall-clock timestamp. Duplicate requests return the current accepted value without changing LSA sequence numbers. Old requests cannot overwrite newer weights. Conflicting values for the same version are rejected. Concurrent updates at opposite endpoints reconcile to the same winning tuple, including when an older confirmation arrives after an incoming newer update.
+- Outgoing update commands run in a single daemon worker in terminal order. The terminal remains available for Y/N and other commands. A per-link lock serializes outgoing operations, but incoming handlers never acquire it. `portLock` protects short local state/LSA changes and is released before network I/O.
+- Each exchange uses the existing 5000 ms connection/read deadlines. Up to three exchanges are attempted; a lost confirmation retries the same version, so the receiver does not apply it twice. If confirmation is still unavailable, print `Weight update unconfirmed` and retain the pending request. A timeout does not prove that the peer did not change: do not blindly roll back. Repeating the same update retries its version; requesting a different weight creates a newer version, even if that value equals the old local weight. Only a confirmed outcome prints `Link weight updated` and `Broadcasting LSAUPDATE`, without trailing periods. A concurrent winning value different from the requested value is reported explicitly.
+- Updating an attached link before HELLO is allowed: both Link objects change, but an unestablished adjacency is not inserted into the LSA early. The later HELLO advertises the agreed cost. Weight changes do not trigger failure detection or remove a neighbor. All routers must run the rebuilt version because SOSPFPacket now includes weight version and request identity fields.
+
+For a routing check, create a chain plus a more expensive alternate route. Increase the weight of an edge on the original shortest path with `update`, wait for `Link weight updated`, then run `detect` and `send` at a different router. Verify the alternate path is selected, and decrease the edge weight again to restore the original path. Test updates from either end, different local port indices, duplicate/zero/large values, simultaneous updates and lost-confirmation retries.
 
 We keep `connect`, `disconnect`, and `update` as starter-code placeholders for later work; we do not implement dynamic topology changes in PA2.
 
@@ -116,6 +128,7 @@ Repeat `start`, `detect`, `send`, and `stats` without restarting the processes. 
 - `LinkStateDatabase.java` stores the latest known LSA per simulated router and computes weighted paths using Dijkstra with `long` distances.
 - `MessageCount.java` protects counters with a shared initialized lock. A broadcast counts once per neighbor. Intermediate application forwarding counts both receipt and transmission.
 - `Path.java` stores the router sequence and edge weights and exposes the next hop.
+- PA3 weight synchronization is implemented by `processUpdate()`, `exchangeWeightUpdate()`, `handleWeightUpdate()` and `applyWeightUpdate()` in Router, and `updateLinkWeight()` in LinkStateDatabase. Link stores per-adjacency version/pending state; SOSPFPacket carries the explicit request/reply fields.
 - Only unknown or newer remote LSAs are installed and forwarded. Old/equal sequence numbers and incoming copies of the local router's own LSA are ignored.
 - LSDB snapshots and accepted/forwarded updates are deep copies. Database access, link slots and statistics have separate synchronization.
 - Network connections and reads use a 5000 ms timeout before object-stream input is constructed. An outgoing attach deliberately waits without a read deadline while the remote user decides Y/N.

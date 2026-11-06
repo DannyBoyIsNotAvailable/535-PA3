@@ -21,6 +21,8 @@ import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.Vector;
 import socs.network.message.LSA;
  
@@ -42,6 +44,18 @@ public class Router {
   static final short TYPE_LSU = 1;          // linkState Update 
   static final short TYPE_APP_MESSAGE = 2;  // application message 
   static final short TYPE_ATTACH = 3;       // attach request and its reply
+  static final short TYPE_WEIGHT_UPDATE = 4; // direct-neighbor weight request/reply
+  private static final String WEIGHT_REQUEST = "WEIGHT_REQUEST";
+  private static final String WEIGHT_ACCEPTED = "WEIGHT_ACCEPTED";
+  private static final String WEIGHT_REJECTED = "WEIGHT_REJECTED";
+  private static final int WEIGHT_UPDATE_ATTEMPTS = 3;
+
+  // Preserve terminal command order while keeping Y/N and other commands responsive.
+  private final ExecutorService weightUpdates = Executors.newSingleThreadExecutor(task -> {
+    Thread worker = new Thread(task, "weight-updates");
+    worker.setDaemon(true);
+    return worker;
+  });
 
   // SOSPFPacket.message inside attach reply 
   static final String ATTACH_ACCEPTED = "ACCEPTED";
@@ -453,6 +467,9 @@ public class Router {
             break;
           case TYPE_APP_MESSAGE:
             handleApplicationMessage(packet);
+            break;
+          case TYPE_WEIGHT_UPDATE:
+            handleWeightUpdate(packet, out);
             break;
           default:
             System.out.println("received unsupported packet type " + packet.sospfType
@@ -945,17 +962,109 @@ public class Router {
       return;
     }
     System.out.println("Link established with " + simulatedIP);
-    System.out.println("Broadcasting LSAUPDATE.");
+    System.out.println("Broadcasting LSAUPDATE");
     // Both components must learn each other's existing topology, not just the new edge.
     broadcastLSAUpdate(lsd.deepCopy(), null);
   }
 
-  /**
-   * update the weight of an attached link
-   */
-  private void updateWeight(String processIP, short processPort,
-                            String simulatedIP, short weight) {
+  // =======================================================================================
+  // PA3: explicit weight synchronization (separate from LSA flooding / failure detection)
+  // =======================================================================================
 
+  private static int compareWeightVersion(long version, String origin,
+                                           long otherVersion, String otherOrigin) {
+    int order = Long.compare(version, otherVersion);
+    return order != 0 ? order : origin.compareTo(otherOrigin);
+  }
+
+  /** Caller holds portLock; never install a weight from a stale or duplicate version. */
+  private boolean applyWeightUpdate(Link link, int weight, long version, String origin) {
+    link.weightClock = Math.max(link.weightClock, version);
+    if (compareWeightVersion(version, origin, link.weightVersion, link.weightOrigin) <= 0) {
+      return false;
+    }
+    link.weight = weight;
+    link.weightVersion = version;
+    link.weightOrigin = origin;
+    return lsd.updateLinkWeight(link.router2.simulatedIPAddress, weight);
+  }
+
+  private SOSPFPacket weightRequest(Link link, int weight, long version, String origin) {
+    SOSPFPacket packet = newPacket(TYPE_WEIGHT_UPDATE, link.router2.simulatedIPAddress);
+    packet.message = WEIGHT_REQUEST;
+    packet.weight = weight;
+    packet.weightVersion = version;
+    packet.weightOrigin = origin;
+    packet.weightRequestId = version + ":" + origin;
+    return packet;
+  }
+
+  /** Only the two endpoints may originate versions for this adjacency. */
+  private boolean validWeightVersion(SOSPFPacket packet, Link link) {
+    return packet.weight >= 0 && packet.weightVersion > 0 && packet.weightOrigin != null
+        && (packet.weightOrigin.equals(rd.simulatedIPAddress)
+            || packet.weightOrigin.equals(link.router2.simulatedIPAddress));
+  }
+
+  /** The receiver resolves srcIP to its own slot; the sender's port index is never transmitted. */
+  private void handleWeightUpdate(SOSPFPacket request, ObjectOutputStream out) throws IOException {
+    SOSPFPacket reply = newPacket(TYPE_WEIGHT_UPDATE, request.srcIP);
+    reply.message = WEIGHT_REJECTED;
+    reply.weightRequestId = request.weightRequestId;
+    boolean changed = false;
+    synchronized (portLock) {
+      Link link = findLink(request.srcIP);
+      if (link != null && rd.simulatedIPAddress.equals(request.dstIP)
+          && link.router2.processPortNumber == request.srcProcessPort
+          && WEIGHT_REQUEST.equals(request.message) && validWeightVersion(request, link)
+          && (request.weightVersion + ":" + request.weightOrigin).equals(request.weightRequestId)) {
+        int order = compareWeightVersion(request.weightVersion, request.weightOrigin,
+            link.weightVersion, link.weightOrigin);
+        // Equal versions must refer to the same value. Older requests get the current value.
+        if (order != 0 || request.weight == link.weight) {
+          changed = applyWeightUpdate(link, request.weight, request.weightVersion, request.weightOrigin);
+          reply.message = WEIGHT_ACCEPTED;
+          reply.weight = link.weight;
+          reply.weightVersion = link.weightVersion;
+          reply.weightOrigin = link.weightOrigin;
+        }
+      }
+    }
+    try {
+      // Confirm before potentially slow flooding. A lost ACK is safe to retry with the same version.
+      out.writeObject(reply);
+      out.flush();
+      stats.countSent(TYPE_WEIGHT_UPDATE);
+    } finally {
+      // Even if ACK transmission fails, advertise the change that was already accepted locally.
+      if (changed) broadcastLSAUpdate(lsd.deepCopy(), null);
+    }
+  }
+
+  private SOSPFPacket exchangeWeightUpdate(Link link, SOSPFPacket request)
+      throws IOException, ClassNotFoundException {
+    RouterDescription neighbor = link.router2;
+    try (Socket socket = openSocket(neighbor.processIPAddress, neighbor.processPortNumber);
+         ObjectOutputStream out = openOutput(socket);
+         ObjectInputStream in = new ObjectInputStream(socket.getInputStream())) {
+      out.writeObject(request);
+      out.flush();
+      stats.countSent(TYPE_WEIGHT_UPDATE);
+      SOSPFPacket reply = readPacket(in);
+      stats.countReceived(reply.sospfType);
+      if (reply.sospfType != TYPE_WEIGHT_UPDATE || !WEIGHT_ACCEPTED.equals(reply.message)
+          || !neighbor.simulatedIPAddress.equals(reply.srcIP)
+          || !rd.simulatedIPAddress.equals(reply.dstIP)
+          || !request.weightRequestId.equals(reply.weightRequestId) || !validWeightVersion(reply, link)) {
+        throw new IOException("invalid or rejected weight confirmation");
+      }
+      int order = compareWeightVersion(reply.weightVersion, reply.weightOrigin,
+          request.weightVersion, request.weightOrigin);
+      if (order < 0 || (order == 0 && reply.weight != request.weight)) {
+        throw new IOException("inconsistent weight confirmation");
+      }
+      return reply;
+    }
   }
 
   /**
@@ -966,8 +1075,86 @@ public class Router {
    * @param portNumber the port number (0-3) to update
    * @param newWeight the new weight/cost for the link attached to this port
    */
-  private void processUpdate(short portNumber, short newWeight) {
-
+  private void processUpdate(int portNumber, int newWeight) {
+    Link link;
+    synchronized (portLock) {
+      if (portNumber < 0 || portNumber >= ports.length || newWeight < 0) {
+        System.out.println("Cannot update: port must be between 0 and 3 and weight must be nonnegative");
+        return;
+      }
+      link = ports[portNumber];
+      if (link == null) {
+        System.out.println("Cannot update: port " + portNumber + " is unused");
+        return;
+      }
+    }
+    // This lock is never acquired by an incoming handler. Do not hold portLock during network I/O.
+    synchronized (link.weightUpdateLock) {
+      SOSPFPacket request;
+      synchronized (portLock) {
+        if (ports[portNumber] != link) {
+          System.out.println("Cannot update: link changed before the update started");
+          return;
+        }
+        if (link.pendingWeightUpdate != null && link.pendingWeightUpdate.weight == newWeight) {
+          request = link.pendingWeightUpdate;
+        } else {
+          // EDGE CASE: a previous ACK may have been lost. Even if the requested value equals
+          // our old local value, send a NEWER version to override that unconfirmed remote update.
+          if (link.pendingWeightUpdate == null && link.weight == newWeight) {
+            System.out.println("Link weight unchanged");
+            return;
+          }
+          if (link.weightClock == Long.MAX_VALUE) {
+            System.out.println("Cannot update: weight version counter exhausted");
+            return;
+          }
+          request = weightRequest(link, newWeight, ++link.weightClock, rd.simulatedIPAddress);
+          link.pendingWeightUpdate = request;
+        }
+      }
+      String failure = "concurrent update still settling";
+      for (int attempt = 0; attempt < WEIGHT_UPDATE_ATTEMPTS; attempt++) {
+        try {
+          SOSPFPacket reply = exchangeWeightUpdate(link, request);
+          boolean settled;
+          boolean changed;
+          int currentWeight;
+          synchronized (portLock) {
+            if (ports[portNumber] != link) {
+              System.out.println("Cannot update: link changed while awaiting confirmation");
+              return;
+            }
+            changed = applyWeightUpdate(link, reply.weight, reply.weightVersion, reply.weightOrigin);
+            settled = compareWeightVersion(link.weightVersion, link.weightOrigin,
+                reply.weightVersion, reply.weightOrigin) == 0;
+            currentWeight = link.weight;
+            if (settled) {
+              link.pendingWeightUpdate = null;
+            } else {
+              // An incoming concurrent update won while this request was in flight.
+              // Send the winning value back rather than overwriting it with a late ACK.
+              request = weightRequest(link, link.weight, link.weightVersion, link.weightOrigin);
+              link.pendingWeightUpdate = request;
+            }
+          }
+          if (settled) {
+            System.out.println(currentWeight == newWeight ? "Link weight updated"
+                : "Weight update superseded; current weight: " + currentWeight);
+            System.out.println("Broadcasting LSAUPDATE");
+            broadcastLSAUpdate(lsd.deepCopy(), null);
+            return;
+          }
+          if (changed) broadcastLSAUpdate(lsd.deepCopy(), null);
+        } catch (IOException | ClassNotFoundException e) {
+          failure = e.getMessage();
+        }
+      }
+      // A timeout cannot prove that the peer did not apply the request. Keep its version
+      // for an idempotent retry; do not roll back blindly or pretend both endpoints succeeded.
+      System.out.println("Weight update unconfirmed: " + failure
+          + "; retry update " + portNumber + " " + newWeight);
+    }
   }
 
   /**
@@ -1190,7 +1377,9 @@ public class Router {
         break;
       case "update":
         if (hasArgumentCount(arguments, 3, "update [Port Number] [New Weight]")) {
-          processUpdate(Short.parseShort(arguments[1]), Short.parseShort(arguments[2]));
+          int portNumber = Integer.parseInt(arguments[1]);
+          int newWeight = Integer.parseInt(arguments[2]);
+          weightUpdates.execute(() -> processUpdate(portNumber, newWeight));
         }
         break;
       default:

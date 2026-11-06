@@ -260,6 +260,24 @@ public synchronized Path findShortestPathTo(String destIP) {
     return result;
   }
 
+  /** Change only this router's existing advertisement; duplicate weights are idempotent. */
+  public synchronized boolean updateLinkWeight(String neighborIP, int weight) {
+    if (neighborIP == null || weight < 0 || rd.simulatedIPAddress.equals(neighborIP)) {
+      return false;
+    }
+    LSA ownLSA = _store.get(rd.simulatedIPAddress);
+    for (LinkDescription ld : ownLSA.links) {
+      if (neighborIP.equals(ld.linkID)) {
+        if (ld.weight == weight) return false;
+        ld.weight = weight;
+        ownLSA.lsaSeqNumber++;
+        return true;
+      }
+    }
+    // An attached neighbor has no LSA entry until HELLO completes. Do not advertise it early.
+    return false;
+  }
+
   private boolean validLSA(LSA lsa) {
     if (lsa == null || lsa.linkStateID == null || lsa.links == null) return false;
     for (LinkDescription ld : lsa.links) {

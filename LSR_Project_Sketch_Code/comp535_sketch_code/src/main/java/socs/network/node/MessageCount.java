@@ -12,7 +12,7 @@ public class MessageCount {
     // A null lock would crash on the very first packet or stats command.
     private final Object count_obj = new Object();
     
-    private final String[] TYPE_MESSAGE = {"HELLO", "LSAUPDATE", "APP_MESSAGE", "ATTACH"};
+    private final String[] TYPE_MESSAGE = {"HELLO", "LSAUPDATE", "APP_MESSAGE", "ATTACH", "WEIGHT_UPDATE"};
     private int[] received = new int [TYPE_MESSAGE.length]; // each entry count the number of certain message it received
     private int[] sent = new int [TYPE_MESSAGE.length];
 

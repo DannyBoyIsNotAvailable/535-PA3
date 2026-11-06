@@ -32,4 +32,10 @@ public class SOSPFPacket implements Serializable {
   // used to send the weight for one link (这个是双向的) new field!
   public int weight;
 
+  // Direct-neighbor WEIGHT_UPDATE request/reply (type 4).
+  // The origin breaks ties between simultaneous updates with the same version counter.
+  public long weightVersion;
+  public String weightOrigin;
+  public String weightRequestId;
+
 }
