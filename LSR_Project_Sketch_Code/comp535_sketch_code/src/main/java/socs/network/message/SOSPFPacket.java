@@ -15,7 +15,8 @@ public class SOSPFPacket implements Serializable {
   public String dstIP;
 
   //common header
-  public short sospfType; //0 - HELLO, 1 - LinkState Update, 2 - Application Message
+  // 0 HELLO, 1 LSAUPDATE, 2 APP_MESSAGE, 3 ATTACH, 4 LINK_DOWN, 5 ROUTER_DOWN, 6 WEIGHT_UPDATE.
+  public short sospfType;
   public String routerID;
 
   //used by HELLO message to identify the sender of the message
@@ -32,13 +33,13 @@ public class SOSPFPacket implements Serializable {
   // used to send the weight for one link (这个是双向的) new field!
   public int weight;
 
-  // Direct-neighbor WEIGHT_UPDATE request/reply (type 4).
+  // Direct-neighbor WEIGHT_UPDATE request/reply (type 6).
   // The origin breaks ties between simultaneous updates with the same version counter.
   public long weightVersion;
   public String weightOrigin;
   public String weightRequestId;
 
-  // Identifies one attach session for HELLO, weight updates and LINK_DOWN (type 5).
+  // Identifies one attach session for HELLO, weight updates, LINK_DOWN (4) and ROUTER_DOWN (5).
   public String linkId;
 
 }

@@ -50,10 +50,14 @@ public class Router {
   static final short TYPE_LSU = 1;          // linkState Update 
   static final short TYPE_APP_MESSAGE = 2;  // application message 
   static final short TYPE_ATTACH = 3;       // attach request and its reply
-  static final short TYPE_WEIGHT_UPDATE = 4; // direct-neighbor weight request/reply
-  static final short TYPE_LINK_DOWN = 5; // explicit adjacency-loss notification/reply
+  // PA3 type assignments match the team's protocol. All routers use this rebuilt JAR.
+  static final short TYPE_LINK_DOWN = 4; // disconnect notification/reply
+  static final short TYPE_ROUTER_DOWN = 5; // quit notification/reply
+  static final short TYPE_WEIGHT_UPDATE = 6; // direct-neighbor weight request/reply
   private static final String LINK_DOWN = "LINK_DOWN";
   private static final String LINK_DOWN_ACK = "LINK_DOWN_ACK";
+  private static final String ROUTER_DOWN = "ROUTER_DOWN";
+  private static final String ROUTER_DOWN_ACK = "ROUTER_DOWN_ACK";
   private static final String FINAL_LSAUPDATE = "FINAL_LSAUPDATE";
   private static final String FINAL_LSAUPDATE_ACK = "FINAL_LSAUPDATE_ACK";
   private static final int DISCONNECT_ATTEMPTS = 3;
@@ -524,7 +528,8 @@ public class Router {
             handleWeightUpdate(packet, out);
             break;
           case TYPE_LINK_DOWN:
-            handleLinkDown(packet, out);
+          case TYPE_ROUTER_DOWN:
+            handleConnectionDown(packet, out);
             break;
           default:
             System.out.println("received unsupported packet type " + packet.sospfType
@@ -806,7 +811,7 @@ public class Router {
   // start (HELLO handshake)
   // =======================================================================================
 
-  // �������������������PA2�н����޸�
+  // 这个部分三个方法都在PA2中进行修改
 
   /**
    * broadcast Hello to neighbors
@@ -1045,7 +1050,7 @@ public class Router {
         // ports[] is already empty. Address the saved peer directly, including non-TWO_WAY links.
         sendFinalLSAUpdate(notice.link, finalLSAs);
         // Failure notification is distinct from the self-LSA and is still attempted if its ACK is lost.
-        notifyLinkDown(notice);
+        notifyAdjacencyLoss(notice, TYPE_ROUTER_DOWN);
       }, topologyTasks));
     }
     try {
@@ -1109,7 +1114,7 @@ public class Router {
         || finalLSA.links.stream().anyMatch(ld -> ld == null || ld.weight < 0
             || !packet.srcIP.equals(ld.linkID))) throw new IOException("invalid final self-LSA");
     // This is deliberately independent of local adjacency state: simultaneous quit/disconnect
-    // or a lost ACK may have already retired this link. Session cleanup belongs to LINK_DOWN.
+    // or a lost ACK may have already retired this link. Session cleanup belongs to ROUTER_DOWN.
     List<LSA> updates = lsd.merge(packet.lsaArray);
     SOSPFPacket reply = newPacket(TYPE_LSU, packet.srcIP);
     reply.message = FINAL_LSAUPDATE_ACK;
@@ -1212,7 +1217,7 @@ public class Router {
       notice.attempt = attempt;
     }
     boolean queued = executeTopologyTask(() -> {
-      boolean confirmed = notifyLinkDown(notice);
+      boolean confirmed = notifyAdjacencyLoss(notice, TYPE_LINK_DOWN);
       synchronized (portLock) {
         if (confirmed) pendingDisconnects.remove(notice.link.linkId);
       }
@@ -1246,10 +1251,16 @@ public class Router {
     return true;
   }
 
-  private boolean notifyLinkDown(DisconnectNotice notice) {
+  /** Disconnect and quit share reliable session cleanup, with distinct message types. */
+  private boolean notifyAdjacencyLoss(DisconnectNotice notice, short type) {
+    if (type != TYPE_LINK_DOWN && type != TYPE_ROUTER_DOWN) {
+      throw new IllegalArgumentException("unsupported adjacency-loss type");
+    }
     Link link = notice.link;
-    SOSPFPacket request = linkPacket(TYPE_LINK_DOWN, link);
-    request.message = LINK_DOWN;
+    boolean routerDown = type == TYPE_ROUTER_DOWN;
+    String acknowledgment = routerDown ? ROUTER_DOWN_ACK : LINK_DOWN_ACK;
+    SOSPFPacket request = linkPacket(type, link);
+    request.message = routerDown ? ROUTER_DOWN : LINK_DOWN;
     String failure = "missing confirmation";
     for (int attempt = 0; attempt < DISCONNECT_ATTEMPTS; attempt++) {
       try (Socket socket = openSocket(link.router2.processIPAddress, link.router2.processPortNumber);
@@ -1257,10 +1268,10 @@ public class Router {
            ObjectInputStream in = new ObjectInputStream(socket.getInputStream())) {
         out.writeObject(request);
         out.flush();
-        stats.countSent(TYPE_LINK_DOWN);
+        stats.countSent(type);
         SOSPFPacket reply = readPacket(in);
         stats.countReceived(reply.sospfType);
-        if (reply.sospfType == TYPE_LINK_DOWN && LINK_DOWN_ACK.equals(reply.message)
+        if (reply.sospfType == type && acknowledgment.equals(reply.message)
             && link.linkId.equals(reply.linkId) && link.router2.simulatedIPAddress.equals(reply.srcIP)
             && rd.simulatedIPAddress.equals(reply.dstIP)) return true;
         failure = "unexpected confirmation";
@@ -1268,21 +1279,24 @@ public class Router {
         failure = e.getMessage();
       }
     }
-    System.out.println("Disconnect notification unconfirmed for " + link.router2.simulatedIPAddress
+    System.out.println((routerDown ? "Router-down" : "Disconnect")
+        + " notification unconfirmed for " + link.router2.simulatedIPAddress
         + ": " + failure + (shuttingDown ? "" : "; retry disconnect " + notice.port));
     return false;
   }
 
-  private void handleLinkDown(SOSPFPacket request, ObjectOutputStream out) throws IOException {
-    SOSPFPacket reply = newPacket(TYPE_LINK_DOWN, request.srcIP);
+  private void handleConnectionDown(SOSPFPacket request, ObjectOutputStream out) throws IOException {
+    boolean routerDown = request.sospfType == TYPE_ROUTER_DOWN;
+    String notification = routerDown ? ROUTER_DOWN : LINK_DOWN;
+    SOSPFPacket reply = newPacket(request.sospfType, request.srcIP);
     reply.linkId = request.linkId;
-    reply.message = "LINK_DOWN_REJECTED";
+    reply.message = notification + "_REJECTED";
     boolean removed = false;
     synchronized (portLock) {
       Link link = findLink(request.srcIP);
       if (rd.simulatedIPAddress.equals(request.dstIP) && request.srcIP != null
           && !rd.simulatedIPAddress.equals(request.srcIP) && request.srcProcessPort > 0
-          && LINK_DOWN.equals(request.message) && request.linkId != null && !request.linkId.isEmpty()
+          && notification.equals(request.message) && request.linkId != null && !request.linkId.isEmpty()
           && (link == null || !link.linkId.equals(request.linkId)
               || link.router2.processPortNumber == request.srcProcessPort)) {
         if (link != null && link.linkId.equals(request.linkId)) removed = removeLink(link);
@@ -1293,13 +1307,13 @@ public class Router {
           pendingAttachDecision.complete(false);
           pendingAttachDecision = null;
         }
-        reply.message = LINK_DOWN_ACK;
+        reply.message = routerDown ? ROUTER_DOWN_ACK : LINK_DOWN_ACK;
       }
     }
     try {
       out.writeObject(reply);
       out.flush();
-      stats.countSent(TYPE_LINK_DOWN);
+      stats.countSent(request.sospfType);
     } finally {
       if (removed) broadcastLSAUpdate(lsd.deepCopy(), null);
     }
