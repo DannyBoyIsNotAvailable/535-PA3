@@ -26,6 +26,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.Vector;
@@ -53,6 +54,8 @@ public class Router {
   static final short TYPE_LINK_DOWN = 5; // explicit adjacency-loss notification/reply
   private static final String LINK_DOWN = "LINK_DOWN";
   private static final String LINK_DOWN_ACK = "LINK_DOWN_ACK";
+  private static final String FINAL_LSAUPDATE = "FINAL_LSAUPDATE";
+  private static final String FINAL_LSAUPDATE_ACK = "FINAL_LSAUPDATE_ACK";
   private static final int DISCONNECT_ATTEMPTS = 3;
   private static final String WEIGHT_REQUEST = "WEIGHT_REQUEST";
   private static final String WEIGHT_ACCEPTED = "WEIGHT_ACCEPTED";
@@ -92,6 +95,7 @@ public class Router {
   // PA3: only an explicitly completed local start enables outgoing connect.
   // Receiving HELLO from another router does not set this flag.
   private volatile boolean started = false;
+  private volatile boolean shuttingDown = false;
 
   // Guards ports[], reservedPorts[] 
   private final Object portLock = new Object();
@@ -99,6 +103,8 @@ public class Router {
   // Guarded by portLock. Retired IDs prevent delayed messages from resurrecting old sessions.
   private final Set<String> retiredLinkIds = new HashSet<>();
   private final Map<String, DisconnectNotice> pendingDisconnects = new HashMap<>();
+  // A quit must also retire requests waiting for a remote user's Y/N decision.
+  private final Map<String, Link> pendingAttachLinks = new HashMap<>();
 
   private static class DisconnectNotice {
     final Link link;
@@ -124,6 +130,7 @@ public class Router {
   
   // A letter box
   private volatile CompletableFuture<Boolean> pendingAttachDecision;
+  private String pendingAttachId; // Guarded by portLock; cancels an unanswered retired request.
 
   // It's a HashSet that keep tracking the current attach (those haven't receive response)
   // which make sure won't have duplicate attach after the attach request been sent
@@ -193,6 +200,7 @@ public class Router {
   /** Reserves the first port that is neither occupied nor reserved. Returns -1 if none. */
   private int reservePort() {
     synchronized (portLock) {
+      if (shuttingDown) return -1;
       for (int i = 0; i < ports.length; i++) {
         if (ports[i] == null && !reservedPorts[i]) {
           reservedPorts[i] = true;
@@ -219,6 +227,8 @@ public class Router {
    */
   private boolean commitPort(int port, Link link) {
     synchronized (portLock) {
+      // EDGE CASE: an acceptance may arrive after quit cleared all reservations.
+      if (shuttingDown) return false;
       if (!reservedPorts[port] || ports[port] != null) {
       throw new IllegalStateException("Port not reserved or it's unexpectedly occupied.");
     }
@@ -277,7 +287,7 @@ public class Router {
   private boolean advanceNeighborStatus(Link link, RouterStatus target) {
     boolean changed;
     synchronized (portLock) {
-      if (getPort(link) < 0) return false;
+      if (shuttingDown || getPort(link) < 0) return false;
       RouterStatus current = link.router2.status;
       changed = current == null || current.ordinal() < target.ordinal();
       if (changed) { // check if the changed of status is legal
@@ -377,7 +387,7 @@ public class Router {
       int port = getPort(link);
       // EDGE CASE: port 0 is valid; -1 means the link is no longer installed.
       // Keep the checks and insertion together during concurrent start commands.
-      if (isTwoWay(link) && port >= 0) {
+      if (!shuttingDown && isTwoWay(link) && port >= 0) {
         return lsd.addLinkToLSA(link.router2.simulatedIPAddress, port, link.weight);
       }
       return false;
@@ -501,7 +511,11 @@ public class Router {
             handleHello(packet, s, in, out);
             break;
           case TYPE_LSU:
-            receiveLSAUpdate(packet); // step1: merge update step2: broadcast update
+            if (FINAL_LSAUPDATE.equals(packet.message)) {
+              handleFinalLSAUpdate(packet, out);
+            } else {
+              receiveLSAUpdate(packet); // step1: merge update step2: broadcast update
+            }
             break;
           case TYPE_APP_MESSAGE:
             handleApplicationMessage(packet);
@@ -542,6 +556,7 @@ public class Router {
   /** Shared attach phase; null means THIS request did not establish a link. */
   private Link attachLink(String processIP, short processPort,
                           String simulatedIP, short weight) {
+    if (shuttingDown) return null;
     // EDGE CASE: Dijkstra needs nonnegative weights. Validate before reserving
     // a port or sending a request; zero-cost links remain valid.
     if (weight < 0 || processPort <= 0) {
@@ -555,6 +570,7 @@ public class Router {
     // A rapid reconnect must first finish removal of the old session at this same peer.
     if (!settlePriorDisconnects(simulatedIP, processPort)) return null;
     synchronized (portLock) {
+      if (shuttingDown) return null;
       if (findLink(simulatedIP) != null) {
         System.out.println("Cannot attach: a link to " + simulatedIP + " already exists.");
         return null;
@@ -567,6 +583,7 @@ public class Router {
 
     int port = -1;
     boolean committed = false;
+    String requestId = null;
     try {
       port = reservePort();
       if (port == -1) {
@@ -581,6 +598,15 @@ public class Router {
         SOSPFPacket request = newPacket(TYPE_ATTACH, simulatedIP);
         request.weight = weight;
         request.linkId = UUID.randomUUID().toString();
+        requestId = request.linkId;
+        RouterDescription pendingPeer = new RouterDescription();
+        pendingPeer.processIPAddress = processIP;
+        pendingPeer.processPortNumber = processPort;
+        pendingPeer.simulatedIPAddress = simulatedIP;
+        synchronized (portLock) {
+          if (shuttingDown) return null;
+          pendingAttachLinks.put(requestId, new Link(rd, pendingPeer, weight, requestId));
+        }
         out.writeObject(request);
         out.flush();  // after we send the message we need to count number of TYPE_ATTACH it sent
         stats.countSent(TYPE_ATTACH);  // count the TYPE_ATTACH
@@ -611,6 +637,7 @@ public class Router {
           remote.status = null; // attached, but no HELLO exchanged yet
           Link link = new Link(rd, remote, weight, reply.linkId);
           synchronized (portLock) {
+            if (shuttingDown) return null;
             committed = commitPort(port, link);
             if (!committed) {
               // EDGE CASE: an incoming attach may have installed the same link.
@@ -637,6 +664,7 @@ public class Router {
     } catch (IOException | ClassNotFoundException e) {
       System.out.println("Attach failed: " + e.getMessage());
     } finally {
+      synchronized (portLock) { pendingAttachLinks.remove(requestId); }
       if (port != -1 && !committed) {
         releasePort(port); // release the reserved slot
       }
@@ -671,7 +699,10 @@ public class Router {
       boolean committed = false;
       try {
         Link existing;
-        if (!rd.simulatedIPAddress.equals(request.dstIP)) {
+        if (shuttingDown) {
+          // No user approval or new adjacency is allowed during graceful shutdown.
+          reply.message = ATTACH_REJECTED;
+        } else if (!rd.simulatedIPAddress.equals(request.dstIP)) {
           // The requester typed the wrong simulated IP for this process.
           System.out.println("received attach request from " + request.srcIP
               + " addressed to " + request.dstIP + " (not me); rejected automatically;");
@@ -702,7 +733,7 @@ public class Router {
         } else {
           System.out.println("received HELLO from " + request.srcIP + ";");
 
-          if (askUserYesNo()) {
+          if (askUserYesNo(request.linkId)) {
             RouterDescription remote = new RouterDescription();
             remote.processIPAddress = request.srcProcessIP;
             remote.processPortNumber = request.srcProcessPort;
@@ -710,7 +741,8 @@ public class Router {
             remote.status = null; // attached, but no HELLO exchanged yet
             synchronized (portLock) {
               // EDGE CASE: an outgoing request may have started while Y/N was pending.
-              if (!preferOutgoingAttach(request.srcIP) && !retiredLinkIds.contains(request.linkId)) {
+              if (!shuttingDown && !preferOutgoingAttach(request.srcIP)
+                  && !retiredLinkIds.contains(request.linkId)) {
                 committed = commitPort(port, new Link(rd, remote, request.weight, request.linkId));
                 Link installed = findLink(request.srcIP);
                 if (installed != null && installed.weight == request.weight
@@ -742,9 +774,13 @@ public class Router {
    * Publishes a decision box for the terminal thread and blocks until the user has typed
    * Y or N. Must be called while holding attachApprovalLock.
    */
-  private boolean askUserYesNo() {
+  private boolean askUserYesNo(String linkId) {
     CompletableFuture<Boolean> decision = new CompletableFuture<>();
-    pendingAttachDecision = decision;
+    synchronized (portLock) {
+      if (shuttingDown || retiredLinkIds.contains(linkId)) return false;
+      pendingAttachDecision = decision;
+      pendingAttachId = linkId;
+    }
     // EDGE CASE: publish the answer box BEFORE printing the question; otherwise
     // a fast Y/N may be parsed as a command and leave the requester waiting.
     System.out.println("Do you accept this request? (Y/N)");
@@ -755,6 +791,11 @@ public class Router {
       return decision.get();
     } catch (InterruptedException | ExecutionException e) {
       return false;
+    } finally {
+      synchronized (portLock) {
+        if (pendingAttachDecision == decision) pendingAttachDecision = null;
+        if (linkId.equals(pendingAttachId)) pendingAttachId = null;
+      }
     }
   }
 
@@ -765,7 +806,7 @@ public class Router {
   // start (HELLO handshake)
   // =======================================================================================
 
-  // 这个部分三个方法都在PA2中进行修改
+  // �������������������PA2�н����޸�
 
   /**
    * broadcast Hello to neighbors
@@ -782,6 +823,7 @@ public class Router {
 
   // HELLO establishes neighbors; each start also exchanges the current full LSDB.
   private void processStart() {
+    if (shuttingDown) return;
     List<Link> links = snapshotLinks();
     boolean complete = true;
     for (Link link : links) {
@@ -799,7 +841,10 @@ public class Router {
           + " run start again once they are accepted.");
     }
     if (complete) {
-      started = true;
+      synchronized (portLock) {
+        if (shuttingDown) return;
+        started = true;
+      }
       if (links.isEmpty()) {
         System.out.println("Router started; no attached routers.");
       }
@@ -816,7 +861,7 @@ public class Router {
 
   // Shared by start and connect; callers advertise the completed adjacency.
   private boolean helloHandshake(Link link) {
-
+    if (shuttingDown || getPort(link) < 0) return false;
     RouterDescription neighbor = link.router2;
     try (Socket socket = openSocket(neighbor.processIPAddress, neighbor.processPortNumber);
          ObjectOutputStream out = openOutput(socket);
@@ -888,7 +933,7 @@ public class Router {
                            ObjectInputStream in, ObjectOutputStream out)
       throws IOException, ClassNotFoundException {
     Link link = findLink(first.srcIP); // check if the connection exist
-    if (link == null || !rd.simulatedIPAddress.equals(first.dstIP)
+    if (shuttingDown || link == null || !rd.simulatedIPAddress.equals(first.dstIP)
         || !link.linkId.equals(first.linkId) || link.router2.processPortNumber != first.srcProcessPort) {
       System.out.println("received HELLO from " + first.srcIP + " but it is not attached; ignored;");
       return;
@@ -953,12 +998,130 @@ public class Router {
    * disconnect with all neighbors and quit the program
    */
   private void processQuit() {
+    if (shutdownRouter()) System.exit(0);
+  }
+
+  /**
+   * Freeze local topology, deliver the final self-LSA and notify every saved peer.
+   * Returns false for an overlapping quit, which must not terminate the first one's work.
+   */
+  private boolean shutdownRouter() {
+    List<DisconnectNotice> notices;
+    Vector<LSA> finalLSAs = new Vector<>();
+    synchronized (portLock) {
+      if (shuttingDown) return false;
+      shuttingDown = true;
+      started = false;
+      // Include earlier disconnects and outgoing attaches still waiting for Y/N.
+      Map<String, DisconnectNotice> targets = new HashMap<>(pendingDisconnects);
+      for (Map.Entry<String, Link> pending : pendingAttachLinks.entrySet()) {
+        targets.putIfAbsent(pending.getKey(), new DisconnectNotice(pending.getValue(), -1));
+      }
+      for (int i = 0; i < ports.length; i++) {
+        Link link = ports[i];
+        if (link != null) {
+          targets.putIfAbsent(link.linkId, new DisconnectNotice(link, i));
+          link.pendingWeightUpdate = null;
+          link.router2.status = null;
+          ports[i] = null;
+        }
+        reservedPorts[i] = false;
+      }
+      notices = new ArrayList<>(targets.values());
+      for (DisconnectNotice notice : notices) retiredLinkIds.add(notice.link.linkId);
+      // EDGE CASE: withdraw all incident edges together, incrementing own seq only once.
+      // This also creates a newer final LSA for an isolated / not-yet-started router.
+      finalLSAs.add(lsd.withdrawOwnLinks());
+      if (pendingAttachDecision != null) {
+        pendingAttachDecision.complete(false);
+        pendingAttachDecision = null;
+      }
+    }
+    weightUpdates.shutdownNow();
+    System.out.println("Broadcasting final LSAUPDATE");
+    List<CompletableFuture<Void>> deliveries = new ArrayList<>();
+    for (DisconnectNotice notice : notices) {
+      deliveries.add(CompletableFuture.runAsync(() -> {
+        // ports[] is already empty. Address the saved peer directly, including non-TWO_WAY links.
+        sendFinalLSAUpdate(notice.link, finalLSAs);
+        // Failure notification is distinct from the self-LSA and is still attempted if its ACK is lost.
+        notifyLinkDown(notice);
+      }, topologyTasks));
+    }
+    try {
+      // Neighbors run independently. Bound the whole shutdown even if a peer never answers.
+      CompletableFuture.allOf(deliveries.toArray(new CompletableFuture<?>[0]))
+          .get(HELLO_TIMEOUT_MS * 20L, TimeUnit.MILLISECONDS);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      System.out.println("Shutdown notifications interrupted; some neighbors are unconfirmed");
+    } catch (ExecutionException | TimeoutException e) {
+      System.out.println("Shutdown notifications incomplete; some neighbors are unconfirmed");
+    }
     try {
       serverSocket.close();
     } catch (IOException ignored) {
       // nothing useful to do while exiting
     }
-    System.exit(0);
+    topologyTasks.shutdownNow();
+    System.out.println("Router shutting down.");
+    return true;
+  }
+
+  /** Retries the identical final LSA; retransmission never increments its sequence number. */
+  private boolean sendFinalLSAUpdate(Link link, Vector<LSA> finalLSAs) {
+    SOSPFPacket request = linkPacket(TYPE_LSU, link);
+    request.message = FINAL_LSAUPDATE;
+    request.lsaArray = finalLSAs;
+    for (int attempt = 0; attempt < DISCONNECT_ATTEMPTS; attempt++) {
+      try (Socket socket = openSocket(link.router2.processIPAddress, link.router2.processPortNumber);
+           ObjectOutputStream out = openOutput(socket);
+           ObjectInputStream in = new ObjectInputStream(socket.getInputStream())) {
+        out.writeObject(request);
+        out.flush();
+        stats.countSent(TYPE_LSU);
+        SOSPFPacket reply = readPacket(in);
+        stats.countReceived(reply.sospfType);
+        if (reply.sospfType == TYPE_LSU && FINAL_LSAUPDATE_ACK.equals(reply.message)
+            && link.linkId.equals(reply.linkId) && link.router2.simulatedIPAddress.equals(reply.srcIP)
+            && rd.simulatedIPAddress.equals(reply.dstIP) && reply.lsaArray != null
+            && reply.lsaArray.size() == 1 && reply.lsaArray.firstElement() != null
+            && rd.simulatedIPAddress.equals(reply.lsaArray.firstElement().linkStateID)
+            && reply.lsaArray.firstElement().lsaSeqNumber == finalLSAs.firstElement().lsaSeqNumber) {
+          return true;
+        }
+      } catch (IOException | ClassNotFoundException e) {
+        // A lost ACK is not evidence that the final LSA was not installed.
+      }
+    }
+    System.out.println("Final LSAUPDATE unconfirmed for " + link.router2.simulatedIPAddress);
+    return false;
+  }
+
+  /** Install first, acknowledge even a duplicate, and flood only accepted newer LSAs. */
+  private void handleFinalLSAUpdate(SOSPFPacket packet, ObjectOutputStream out) throws IOException {
+    if (!rd.simulatedIPAddress.equals(packet.dstIP) || packet.srcIP == null
+        || rd.simulatedIPAddress.equals(packet.srcIP) || packet.srcProcessPort <= 0
+        || packet.linkId == null || packet.linkId.isEmpty() || packet.lsaArray == null
+        || packet.lsaArray.size() != 1) throw new IOException("invalid final LSAUPDATE");
+    LSA finalLSA = packet.lsaArray.firstElement();
+    if (finalLSA == null || !packet.srcIP.equals(finalLSA.linkStateID) || finalLSA.links == null
+        || finalLSA.links.stream().anyMatch(ld -> ld == null || ld.weight < 0
+            || !packet.srcIP.equals(ld.linkID))) throw new IOException("invalid final self-LSA");
+    // This is deliberately independent of local adjacency state: simultaneous quit/disconnect
+    // or a lost ACK may have already retired this link. Session cleanup belongs to LINK_DOWN.
+    List<LSA> updates = lsd.merge(packet.lsaArray);
+    SOSPFPacket reply = newPacket(TYPE_LSU, packet.srcIP);
+    reply.message = FINAL_LSAUPDATE_ACK;
+    reply.linkId = packet.linkId;
+    reply.lsaArray = packet.lsaArray;
+    try {
+      out.writeObject(reply);
+      out.flush();
+      stats.countSent(TYPE_LSU);
+    } finally {
+      if (!updates.isEmpty()) broadcastLSAUpdate(new Vector<>(updates), packet.srcIP);
+    }
   }
 
   // =======================================================================================
@@ -991,6 +1154,7 @@ public class Router {
     List<DisconnectNotice> notices = new ArrayList<>();
     boolean removed = false;
     synchronized (portLock) {
+      if (shuttingDown) return;
       if (portNumber < 0 || portNumber >= ports.length) {
         System.out.println("Cannot disconnect: port must be between 0 and 3");
         return;
@@ -1017,13 +1181,24 @@ public class Router {
       System.out.println("Port " + portNumber + " disconnected");
       System.out.println("Broadcasting LSAUPDATE");
       // Notify the peer and flood to remaining neighbors independently; neither holds portLock.
-      topologyTasks.execute(() -> broadcastLSAUpdate(lsd.deepCopy(), null));
+      executeTopologyTask(() -> broadcastLSAUpdate(lsd.deepCopy(), null));
     }
     for (DisconnectNotice notice : notices) queueDisconnectNotice(notice);
   }
 
   private boolean isRetiredLink(String id) {
     synchronized (portLock) { return retiredLinkIds.contains(id); }
+  }
+
+  private boolean executeTopologyTask(Runnable task) {
+    try {
+      topologyTasks.execute(task);
+      return true;
+    } catch (RejectedExecutionException e) {
+      // An earlier disconnect may reach this enqueue after quit has finished cleanup.
+      if (!shuttingDown) throw e;
+      return false;
+    }
   }
 
   private CompletableFuture<Boolean> queueDisconnectNotice(DisconnectNotice notice) {
@@ -1036,13 +1211,14 @@ public class Router {
       attempt = new CompletableFuture<>();
       notice.attempt = attempt;
     }
-    topologyTasks.execute(() -> {
+    boolean queued = executeTopologyTask(() -> {
       boolean confirmed = notifyLinkDown(notice);
       synchronized (portLock) {
         if (confirmed) pendingDisconnects.remove(notice.link.linkId);
       }
       attempt.complete(confirmed);
     });
+    if (!queued) attempt.complete(false);
     return attempt;
   }
 
@@ -1093,7 +1269,7 @@ public class Router {
       }
     }
     System.out.println("Disconnect notification unconfirmed for " + link.router2.simulatedIPAddress
-        + ": " + failure + "; retry disconnect " + notice.port);
+        + ": " + failure + (shuttingDown ? "" : "; retry disconnect " + notice.port));
     return false;
   }
 
@@ -1112,6 +1288,11 @@ public class Router {
         if (link != null && link.linkId.equals(request.linkId)) removed = removeLink(link);
         // ACK duplicate/old notifications too, while leaving a reconnected link untouched.
         retiredLinkIds.add(request.linkId);
+        // Cancel an unanswered incoming attach for this session; its handler releases the reservation.
+        if (request.linkId.equals(pendingAttachId) && pendingAttachDecision != null) {
+          pendingAttachDecision.complete(false);
+          pendingAttachDecision = null;
+        }
         reply.message = LINK_DOWN_ACK;
       }
     }
@@ -1133,6 +1314,7 @@ public class Router {
    */
   private void processConnect(String processIP, short processPort,
                               String simulatedIP, short weight) {
+    if (shuttingDown) return;
     if (!started) {
       System.out.println("Cannot connect: run start first and let it complete.");
       return;
@@ -1165,6 +1347,7 @@ public class Router {
 
   /** Caller holds portLock; never install a weight from a stale or duplicate version. */
   private boolean applyWeightUpdate(Link link, int weight, long version, String origin) {
+    if (shuttingDown || getPort(link) < 0) return false;
     link.weightClock = Math.max(link.weightClock, version);
     if (compareWeightVersion(version, origin, link.weightVersion, link.weightOrigin) <= 0) {
       return false;
@@ -1202,7 +1385,7 @@ public class Router {
     boolean changed = false;
     synchronized (portLock) {
       Link link = findLink(request.srcIP);
-      if (link != null && rd.simulatedIPAddress.equals(request.dstIP)
+      if (!shuttingDown && link != null && rd.simulatedIPAddress.equals(request.dstIP)
           && link.router2.processPortNumber == request.srcProcessPort
           && WEIGHT_REQUEST.equals(request.message) && validWeightVersion(request, link)
           && (request.weightVersion + ":" + request.weightOrigin).equals(request.weightRequestId)) {
@@ -1266,6 +1449,7 @@ public class Router {
   private void processUpdate(int portNumber, int newWeight, Link expectedLink) {
     Link link;
     synchronized (portLock) {
+      if (shuttingDown) return;
       if (portNumber < 0 || portNumber >= ports.length || newWeight < 0) {
         System.out.println("Cannot update: port must be between 0 and 3 and weight must be nonnegative");
         return;
@@ -1284,7 +1468,7 @@ public class Router {
     synchronized (link.weightUpdateLock) {
       SOSPFPacket request;
       synchronized (portLock) {
-        if (ports[portNumber] != link) {
+        if (shuttingDown || ports[portNumber] != link) {
           System.out.println("Cannot update: link changed before the update started");
           return;
         }
@@ -1308,7 +1492,7 @@ public class Router {
       String failure = "concurrent update still settling";
       for (int attempt = 0; attempt < WEIGHT_UPDATE_ATTEMPTS; attempt++) {
         synchronized (portLock) {
-          if (ports[portNumber] != link) {
+          if (shuttingDown || ports[portNumber] != link) {
             System.out.println("Cannot update: link changed while awaiting confirmation");
             return;
           }
@@ -1319,7 +1503,7 @@ public class Router {
           boolean changed;
           int currentWeight;
           synchronized (portLock) {
-            if (ports[portNumber] != link) {
+            if (shuttingDown || ports[portNumber] != link) {
               System.out.println("Cannot update: link changed while awaiting confirmation");
               return;
             }
@@ -1456,6 +1640,12 @@ public class Router {
           continue;
         }
 
+        // EDGE CASE: quit must remain available even while an attach asks for Y/N.
+        if (command.equals("quit")) {
+          processQuit();
+          return;
+        }
+
         // The line answers a pending attach request, not a command.
         CompletableFuture<Boolean> decision = pendingAttachDecision;
         if (decision != null) {
@@ -1494,6 +1684,7 @@ public class Router {
 
   /** Parses one command line and runs the matching process* method. */
   private void runCommand(String command) {
+    if (shuttingDown) return;
     command = command.trim();
     if (command.isEmpty()) {
       return;

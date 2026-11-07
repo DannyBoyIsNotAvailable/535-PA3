@@ -1,6 +1,6 @@
-# PA2 and PA3 Connect / Update / Disconnect Implementation Notes
+# PA2 and PA3 Implementation Notes
 
-This README describes PA2 and the PA3 `connect`, `update` and `disconnect` extensions. Run all commands below from the Java project directory containing `pom.xml`, `src/`, and `conf/`. Disconnect uses explicit adjacency-loss notifications as described below. PA3 graceful quit is not implemented yet.
+This README describes PA2 and the PA3 `connect`, `update`, `disconnect` and graceful `quit` extensions. Run all commands below from the Java project directory containing `pom.xml`, `src/`, and `conf/`. Disconnect and quit use explicit adjacency-loss notifications as documented below.
 
 ## Collaboration Statement
 
@@ -62,7 +62,7 @@ Type these at the router's `>>` prompt. Brackets describe placeholders: replace 
 | `detect [Destination Simulated IP]` | Compute and print the weighted shortest path. |
 | `send [Destination Simulated IP] [Message]` | Deliver an application message along the shortest path. The message may contain spaces. |
 | `stats` | Display sent/received counts for HELLO, LSAUPDATE, APP_MESSAGE, ATTACH, WEIGHT_UPDATE and LINK_DOWN. |
-| `quit` | Close this router's listener and exit the process. |
+| `quit` | Withdraw all local adjacencies, deliver the final self-originated LSA, notify peers to clean up, then close the listener and exit. |
 
 `attach` stores the approved link but does not synchronize the LSDB. Wait for acceptance before running `start`. Commands accept repeated spaces or tabs between arguments and report usage for missing or extra arguments. `send` preserves whitespace inside the message body.
 
@@ -96,12 +96,27 @@ For a routing check, create a chain plus a more expensive alternate route. Incre
 - Each attach request proposes a fresh UUID adjacency ID; its acceptance establishes the shared ID at both endpoints. HELLO, weight requests/confirmations and LINK_DOWN carry that ID. Removed IDs are retained as tombstones for the life of the router process. A delayed old disconnect or weight message cannot remove/change a reconnected Link, even when the same simulated IP, process port or local slot is reused. A delayed attach acceptance/HELLO cannot resurrect a retired adjacency.
 - Notifications use the existing 5000 ms connection/read deadlines with up to three attempts. Lost confirmations retry the same adjacency ID. If still unconfirmed, local removal remains in effect and the saved notice remains available: repeat `disconnect` on its now-empty old slot to retry it, without incrementing the LSA sequence again. An immediate attach/connect to the same peer process first waits for/retries the saved cleanup notice (up to 20 seconds per pending notice), and fails explicitly if cleanup is unconfirmed. Reconnecting to a different process port does not wait on the old process. A late retry can only reference the old ID.
 - Update commands capture their Link when queued and check that it is still installed before sending and after receiving confirmation. Thus a queued operation or delayed ACK cannot modify a newly connected neighbor in the same slot. Incoming weight requests from retired sessions are rejected. No weight timeout alone disconnects a link.
-- Normal per-message TCP sockets close after each exchange; their closure is not interpreted as adjacency loss. This implementation uses explicit notifications for graceful disconnect, not heartbeat detection of unannounced process crashes. Graceful quit will need to reuse the same neighbor-cleanup mechanism in its own implementation. All participating routers must use the rebuilt protocol version.
+- Normal per-message TCP sockets close after each exchange; their closure is not interpreted as adjacency loss. This implementation uses explicit notifications for graceful disconnect and quit, not heartbeat detection of unannounced process crashes. All participating routers must use the rebuilt protocol version.
 - After convergence, `detect` and `send` use the reduced topology automatically. If another route exists they use it; otherwise they print `Path not found`. Both freed ports can be used by later attach/connect commands.
 
 For a demo, build a five-router chain with an alternate edge, disconnect a chain edge and check that both endpoints free their slots and advertise removal. Check `detect`/`send` from a third router, then disconnect a bridge to partition the topology and check `Path not found`. Reconnect with a different weight, replay an old notification, and verify that the new adjacency survives. Also test port 0, invalid/empty slots, repeated/simultaneous disconnect, update on a removed port, and disconnect during an in-flight weight update.
 
-We keep `connect`, `disconnect`, and `update` as starter-code placeholders for later work; we do not implement dynamic topology changes in PA2.
+## PA3 graceful quit and adjacency-loss notification
+
+- `quit` first sets a shutdown flag under `portLock`. It saves the current links, outstanding disconnect notices and outgoing attach requests awaiting approval. It clears all local slots/reservations, retires the saved adjacency IDs, cancels pending weight state and rejects any unanswered incoming attach. A single `withdrawOwnLinks()` operation removes all neighbor LinkDescriptions, retains the self-link and increments the local LSA sequence once, including for an isolated or not-yet-started router. The final LSA is a deep copy and stays unchanged across retries.
+- The router prints `Broadcasting final LSAUPDATE`. Since its ports are now empty, it sends directly to the saved peer process addresses rather than using the normal port-based broadcaster. Attached neighbors without a completed HELLO are also notified. Peers are processed independently in parallel. For each saved adjacency, the final LSA exchange precedes its LINK_DOWN exchange.
+- **Final LSA delivery:** a normal LSAUPDATE (packet type 1) with message `FINAL_LSAUPDATE` carries only the quitting router's revised self-originated LSA and the adjacency ID. The receiver uses the existing sequence comparison: install only an unknown/newer LSA and flood only accepted updates to TWO_WAY neighbors except the immediate sender. It sends `FINAL_LSAUPDATE_ACK` on the same socket after merging, before flooding. A repeated final packet is acknowledged without reinstalling/reflooding an equal/older LSA. The ACK echoes the adjacency ID and final LSA identity/sequence; it confirms processing at that receiver, not global convergence.
+- **Failure-detection mechanism for quit:** after the final LSA exchange, reuse the explicit LINK_DOWN request/reply (type 5) for each saved adjacency. This is separate from LSA delivery. Each receiving neighbor removes its own matching Link and LinkDescription, frees its slot, increments its own LSA sequence once if an advertised edge was removed, and floods its revised LSA to remaining neighbors. An unanswered incoming attach for the retired ID is cancelled too. Duplicate or overlapping disconnect/quit notifications are acknowledged without another removal or sequence increment; retired session IDs protect replacement links.
+- Both exchanges use the existing 5000 ms connect/read deadlines and at most three attempts each. A lost final ACK retransmits the identical LSA/sequence; a lost LINK_DOWN_ACK retransmits the same adjacency ID. Even if final delivery remains unconfirmed, LINK_DOWN is still attempted. Failed exchanges are reported explicitly. All per-neighbor jobs are awaited with a shared 100-second upper bound; only then is the listener closed, the notification executor stopped, `Router shutting down.` printed and the process terminated. Ordinary successful shutdown completes as soon as those local deliveries are confirmed; it does not wait for whole-network convergence. EOF uses the same shutdown path. `quit` is accepted even at a pending Y/N prompt.
+- The shutdown flag is checked at reservation, commit, HELLO/LSA insertion and weight-application points, not only at command entry. Late acceptances or weight/HELLO confirmations cannot recreate a link or modify the final self-LSA. Queued weight work is cancelled. An overlapping quit returns without closing the first shutdown's sockets or incrementing its sequence again. A disconnect racing with quit cannot enqueue work into a stopped executor unchecked.
+- Explicit notifications cover graceful commands. They do not guarantee cleanup after arbitrary process crashes or persistent network failure. An unconfirmed notification is reported before exit, and no heartbeat is claimed. Final LSA/ACK packets count as LSAUPDATE messages; cleanup packets/ACKs count as LINK_DOWN. Every participant must run the rebuilt version to understand the final-update confirmation.
+
+For a demo, build a five-router chain with an alternate edge, quit an intermediate router and check `detect`/`send` on survivors: the quit router is unreachable and traffic between remaining routers uses the alternate route. Inspect `lsd` to verify the final withdrawn LSA and both direct neighbors' own revised LSAs; reuse their freed slots with attach/connect. Also test isolated/unstarted quit, attached-only neighbors, simultaneous quits, a pending Y/N request, overlapping disconnect or weight update, and dropped confirmations. Expected normal quit output is:
+
+```text
+Broadcasting final LSAUPDATE
+Router shutting down.
+```
 
 ## Example validation
 

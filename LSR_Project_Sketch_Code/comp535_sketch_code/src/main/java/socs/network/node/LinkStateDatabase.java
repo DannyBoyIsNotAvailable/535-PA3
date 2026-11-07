@@ -54,14 +54,14 @@ private static class PQEntry {
  * this will cover all the edges for all routers
  */
 
-// NOTE: linkStateID-current router, 是自己的 linkID-target router, 是对方的
+// NOTE: linkStateID-current router, ���Լ��� linkID-target router, �ǶԷ���
 private Map<String, Map<String, Integer>> constructGraph() {
   Map<String, Map<String, Integer>> graph = new HashMap<>();
   for (LSA lsa : _store.values()) { 
     Map<String, Integer> edges = new HashMap<>();
 
     for (LinkDescription ld : lsa.links) {
-      if (ld.linkID.equals(lsa.linkStateID)) continue; // self 会存一个自连接
+      if (ld.linkID.equals(lsa.linkStateID)) continue; // self ���һ��������
       edges.put(ld.linkID, ld.weight);
     }
     graph.put(lsa.linkStateID, edges);
@@ -285,6 +285,14 @@ public synchronized Path findShortestPathTo(String destIP) {
     boolean removed = ownLSA.links.removeIf(ld -> neighborIP.equals(ld.linkID));
     if (removed) ownLSA.lsaSeqNumber++;
     return removed;
+  }
+
+  /** Quit is one local topology change, even with no advertised neighbors. */
+  public synchronized LSA withdrawOwnLinks() {
+    LSA ownLSA = _store.get(rd.simulatedIPAddress);
+    ownLSA.links.removeIf(ld -> !rd.simulatedIPAddress.equals(ld.linkID));
+    ownLSA.lsaSeqNumber++;
+    return copy(ownLSA);
   }
 
   private boolean validLSA(LSA lsa) {
