@@ -109,6 +109,13 @@ public class Router {
   private final Map<String, DisconnectNotice> pendingDisconnects = new HashMap<>();
   // A quit must also retire requests waiting for a remote user's Y/N decision.
   private final Map<String, Link> pendingAttachLinks = new HashMap<>();
+  // An accepted request may reuse an existing session with a different ID.
+  // Bind the request to that exact Link so cancellation can clean it without touching a reconnect.
+  private final Map<String, Link> acceptedAttachRequests = new HashMap<>();
+
+  private enum AdjacencyLossReason {
+    LOCAL_DISCONNECT, CONNECT_ROLLBACK, PEER_DISCONNECT, PEER_QUIT, CONNECTION_REFUSED
+  }
 
   private static class DisconnectNotice {
     final Link link;
@@ -261,19 +268,35 @@ public class Router {
     }
   }
 
+  /** Caller holds portLock. Retire the actual session and every request that adopted it. */
+  private void retireSession(Link link) {
+    retiredLinkIds.add(link.linkId);
+    acceptedAttachRequests.entrySet().removeIf(entry -> {
+      if (entry.getValue() != link) return false;
+      retiredLinkIds.add(entry.getKey());
+      return true;
+    });
+    link.pendingWeightUpdate = null;
+    link.router2.status = null;
+  }
+
   /**
-   * Removes exactly this link object from the port table and frees its port.
-   * Compares by reference (ports[i] == link)
+   * Shared local cleanup for disconnect, connect rollback and received failure notifications.
+   * Object identity protects reused ports. Network I/O and flooding belong to the caller.
    */
-  private boolean removeLink(Link link) {
+  private boolean handleAdjacentLoss(Link link, AdjacencyLossReason reason) {
+    if (link == null) return false;
     synchronized (portLock) {
       for (int i = 0; i < ports.length; i++) {
         if (ports[i] == link) {
           ports[i] = null;
-          retiredLinkIds.add(link.linkId);
-          link.pendingWeightUpdate = null;
-          link.router2.status = null;
+          retireSession(link);
           lsd.removeLinkFromLSA(link.router2.simulatedIPAddress);
+          if (reason == AdjacencyLossReason.LOCAL_DISCONNECT
+              || reason == AdjacencyLossReason.CONNECT_ROLLBACK) {
+            // Record before releasing the lock so a concurrent quit cannot miss this notice.
+            pendingDisconnects.putIfAbsent(link.linkId, new DisconnectNotice(link, i));
+          }
           return true;
         }
       }
@@ -561,6 +584,11 @@ public class Router {
   /** Shared attach phase; null means THIS request did not establish a link. */
   private Link attachLink(String processIP, short processPort,
                           String simulatedIP, short weight) {
+    return attachLink(processIP, processPort, simulatedIP, weight, false);
+  }
+
+  private Link attachLink(String processIP, short processPort,
+                          String simulatedIP, short weight, boolean rollbackOnFailure) {
     if (shuttingDown) return null;
     // EDGE CASE: Dijkstra needs nonnegative weights. Validate before reserving
     // a port or sending a request; zero-cost links remain valid.
@@ -588,7 +616,10 @@ public class Router {
 
     int port = -1;
     boolean committed = false;
+    boolean established = false;
+    boolean rejected = false;
     String requestId = null;
+    Link pendingRequest = null;
     try {
       port = reservePort();
       if (port == -1) {
@@ -610,7 +641,8 @@ public class Router {
         pendingPeer.simulatedIPAddress = simulatedIP;
         synchronized (portLock) {
           if (shuttingDown) return null;
-          pendingAttachLinks.put(requestId, new Link(rd, pendingPeer, weight, requestId));
+          pendingRequest = new Link(rd, pendingPeer, weight, requestId);
+          pendingAttachLinks.put(requestId, pendingRequest);
         }
         out.writeObject(request);
         out.flush();  // after we send the message we need to count number of TYPE_ATTACH it sent
@@ -624,6 +656,8 @@ public class Router {
         // Blocks until the remote user has typed Y or N.
         SOSPFPacket reply = readPacket(in);
         stats.countReceived(reply.sospfType);
+        rejected = reply.sospfType == TYPE_ATTACH && ATTACH_REJECTED.equals(reply.message)
+            && rd.simulatedIPAddress.equals(reply.dstIP);
         if (reply.sospfType != TYPE_ATTACH || !simulatedIP.equals(reply.srcIP)
             || !rd.simulatedIPAddress.equals(reply.dstIP)) {
           System.out.println("Attach failed: unexpected reply.");
@@ -657,6 +691,7 @@ public class Router {
             }
           }
           System.out.println("Your attach request has been accepted;");
+          established = true;
           return link;
         } else if (findLink(simulatedIP) != null) {
           // Simultaneous attach: the peer rejected our request, but we accepted theirs.
@@ -669,11 +704,25 @@ public class Router {
     } catch (IOException | ClassNotFoundException e) {
       System.out.println("Attach failed: " + e.getMessage());
     } finally {
-      synchronized (portLock) { pendingAttachLinks.remove(requestId); }
+      DisconnectNotice cancellation = null;
+      synchronized (portLock) {
+        pendingAttachLinks.remove(requestId);
+        if (rollbackOnFailure && !established && !rejected && pendingRequest != null && !shuttingDown) {
+          // A lost acceptance can leave only the peer installed. Cancel the known request ID;
+          // its receiver resolves an adopted session through acceptedAttachRequests.
+          retiredLinkIds.add(requestId);
+          cancellation = pendingDisconnects.get(requestId);
+          if (cancellation == null) {
+            cancellation = new DisconnectNotice(pendingRequest, port);
+            pendingDisconnects.put(requestId, cancellation);
+          }
+        }
+      }
       if (port != -1 && !committed) {
         releasePort(port); // release the reserved slot
       }
       outgoingAttachRouters.remove(simulatedIP);
+      if (cancellation != null) queueDisconnectNotice(cancellation);
     }
     return null;
   }
@@ -682,6 +731,22 @@ public class Router {
   private boolean preferOutgoingAttach(String remoteIP) {
     return outgoingAttachRouters.contains(remoteIP)
         && rd.simulatedIPAddress.compareTo(remoteIP) < 0;
+  }
+
+  /** Accept or adopt only an installed Link, and remember the request-to-session relation. */
+  private boolean acceptAttachSession(SOSPFPacket request, SOSPFPacket reply, Link link) {
+    synchronized (portLock) {
+      if (shuttingDown || link == null || getPort(link) < 0
+          || retiredLinkIds.contains(request.linkId) || link.weight != request.weight
+          || link.router2.processPortNumber != request.srcProcessPort) return false;
+      Link previous = acceptedAttachRequests.get(request.linkId);
+      if (previous != null && previous != link) return false;
+      if (!link.linkId.equals(request.linkId)) acceptedAttachRequests.put(request.linkId, link);
+      reply.message = ATTACH_ACCEPTED;
+      reply.weight = link.weight;
+      reply.linkId = link.linkId;
+      return true;
+    }
   }
 
   /**
@@ -719,12 +784,7 @@ public class Router {
           System.out.println("Attach rejected: invalid neighbor or link weight.");
         } else if ((existing = findLink(request.srcIP)) != null) {
           // Keep this reference: disconnect may remove it before a second lookup.
-          if (existing.weight == request.weight
-              && existing.router2.processPortNumber == request.srcProcessPort) {
-            reply.message = ATTACH_ACCEPTED;
-            reply.weight = existing.weight;
-            reply.linkId = existing.linkId;
-          } else {
+          if (!acceptAttachSession(request, reply, existing)) {
             System.out.println("Attach rejected: an existing link has a different endpoint or weight.");
           }
 
@@ -749,12 +809,7 @@ public class Router {
               if (!shuttingDown && !preferOutgoingAttach(request.srcIP)
                   && !retiredLinkIds.contains(request.linkId)) {
                 committed = commitPort(port, new Link(rd, remote, request.weight, request.linkId));
-                Link installed = findLink(request.srcIP);
-                if (installed != null && installed.weight == request.weight
-                    && installed.router2.processPortNumber == request.srcProcessPort) {
-                  reply.message = ATTACH_ACCEPTED;
-                  reply.linkId = installed.linkId;
-                }
+                acceptAttachSession(request, reply, findLink(request.srcIP));
               }
             }
             System.out.println(ATTACH_ACCEPTED.equals(reply.message)
@@ -917,7 +972,7 @@ public class Router {
       // "Connection refused": no process is listening on the neighbour's port any more, so
       // it has quit. Drop the dead link so the port is freed 
       // Other errors (eg: timeout) keep the link, the neighbour may only be slow.
-      if (removeLink(link)) {
+      if (handleAdjacentLoss(link, AdjacencyLossReason.CONNECTION_REFUSED)) {
         System.out.println("start: " + neighbor.simulatedIPAddress
             + " is unreachable (connection refused); link removed;");
       }
@@ -970,11 +1025,13 @@ public class Router {
     // Always exchange the full LSDB, including on a repeated handshake.
     SOSPFPacket update = linkPacket(TYPE_LSU, link);
     update.lsaArray = lsd.deepCopy();
-    out.writeObject(update);
-    out.flush();
-    stats.countSent(TYPE_LSU);
-    if (changed) {
-      broadcastLSAUpdate(update.lsaArray, null);
+    try {
+      out.writeObject(update);
+      out.flush();
+      stats.countSent(TYPE_LSU);
+    } finally {
+      // A failed confirmation write does not undo the responder's already accepted LSA change.
+      if (changed) broadcastLSAUpdate(update.lsaArray, null);
     }
   }
 
@@ -1026,8 +1083,7 @@ public class Router {
         Link link = ports[i];
         if (link != null) {
           targets.putIfAbsent(link.linkId, new DisconnectNotice(link, i));
-          link.pendingWeightUpdate = null;
-          link.router2.status = null;
+          retireSession(link);
           ports[i] = null;
         }
         reservedPorts[i] = false;
@@ -1166,11 +1222,8 @@ public class Router {
       }
       Link link = ports[portNumber];
       if (link != null) {
-        DisconnectNotice notice = new DisconnectNotice(link, portNumber);
-        removeLink(link); // Port, own LSA and pending weight state change atomically.
-        pendingDisconnects.put(link.linkId, notice);
-        notices.add(notice);
-        removed = true;
+        removed = handleAdjacentLoss(link, AdjacencyLossReason.LOCAL_DISCONNECT);
+        notices.add(pendingDisconnects.get(link.linkId));
       } else {
         // Retry unconfirmed notices for this old slot without touching any newer adjacency.
         for (DisconnectNotice notice : pendingDisconnects.values()) {
@@ -1294,12 +1347,16 @@ public class Router {
     boolean removed = false;
     synchronized (portLock) {
       Link link = findLink(request.srcIP);
+      // EDGE CASE: quit may still know only the original attach request ID, while this
+      // receiver already reused an older session. Resolve to the exact accepted Link object.
+      boolean matchesSession = link != null && (link.linkId.equals(request.linkId)
+          || acceptedAttachRequests.get(request.linkId) == link);
       if (rd.simulatedIPAddress.equals(request.dstIP) && request.srcIP != null
           && !rd.simulatedIPAddress.equals(request.srcIP) && request.srcProcessPort > 0
           && notification.equals(request.message) && request.linkId != null && !request.linkId.isEmpty()
-          && (link == null || !link.linkId.equals(request.linkId)
-              || link.router2.processPortNumber == request.srcProcessPort)) {
-        if (link != null && link.linkId.equals(request.linkId)) removed = removeLink(link);
+          && (!matchesSession || link.router2.processPortNumber == request.srcProcessPort)) {
+        if (matchesSession) removed = handleAdjacentLoss(link, routerDown
+            ? AdjacencyLossReason.PEER_QUIT : AdjacencyLossReason.PEER_DISCONNECT);
         // ACK duplicate/old notifications too, while leaving a reconnected link untouched.
         retiredLinkIds.add(request.linkId);
         // Cancel an unanswered incoming attach for this session; its handler releases the reservation.
@@ -1333,20 +1390,41 @@ public class Router {
       System.out.println("Cannot connect: run start first and let it complete.");
       return;
     }
-    Link link = attachLink(processIP, processPort, simulatedIP, weight);
+    Link link = attachLink(processIP, processPort, simulatedIP, weight, true);
     if (link == null) {
       return; // EDGE CASE: never handshake an old link after a rejected request.
     }
-    if (!helloHandshake(link)) {
-      // Keep a timed-out attach for a later start retry; unilateral rollback
-      // would leave the peer's port occupied. No success is printed here.
-      System.out.println("Connect failed: HELLO handshake incomplete; run start to retry if still attached.");
+    int attachedPort = getPort(link);
+    if (!helloHandshake(link) && rollbackFailedConnect(link, attachedPort)) {
+      System.out.println("Connect failed: HELLO handshake incomplete; local adjacency removed");
       return;
     }
     System.out.println("Link established with " + simulatedIP);
     System.out.println("Broadcasting LSAUPDATE");
     // Both components must learn each other's existing topology, not just the new edge.
     broadcastLSAUpdate(lsd.deepCopy(), null);
+  }
+
+  /** Roll back this failed connect without deleting another operation's completed adjacency. */
+  private boolean rollbackFailedConnect(Link link, int oldPort) {
+    DisconnectNotice notice;
+    boolean removed;
+    synchronized (portLock) {
+      if (shuttingDown) return true; // quit already owns cleanup of the saved session
+      if (isTwoWay(link)) return false; // another concurrent handshake completed this adjacency
+      removed = handleAdjacentLoss(link, AdjacencyLossReason.CONNECT_ROLLBACK);
+      // A refused connection or simultaneous disconnect may have already removed the Link.
+      // Notify only its saved ID, never whichever new Link now occupies the old slot.
+      notice = pendingDisconnects.get(link.linkId);
+      if (notice == null) {
+        notice = new DisconnectNotice(link, oldPort);
+        pendingDisconnects.put(link.linkId, notice);
+        retiredLinkIds.add(link.linkId);
+      }
+    }
+    if (removed) executeTopologyTask(() -> broadcastLSAUpdate(lsd.deepCopy(), null));
+    queueDisconnectNotice(notice);
+    return true;
   }
 
   // =======================================================================================
